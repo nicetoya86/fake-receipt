@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "Yeoshin Receipt Guard",
+  "version": "1.0.0",
+  "description": "여신티켓 어드민 영수증 자동 검증 도구 (OCR + EXIF + 국세청 API)",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://api.odcloud.kr/*",
+    "https://admin.fastlane.kr/*",
+    "https://generativelanguage.googleapis.com/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://admin.fastlane.kr/posts/reviews*"],
+      "js": [
+        "lib/exif.js",
+        "lib/blockhash.js",
+        "content.js"
+      ],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "lib/exif.js",
+        "lib/blockhash.js"
+      ],
+      "matches": ["https://admin.fastlane.kr/*"]
+    }
+  ]
+}

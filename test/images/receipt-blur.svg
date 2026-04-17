@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="560" viewBox="0 0 400 560">
+  <defs>
+    <filter id="blur">
+      <feGaussianBlur stdDeviation="3.5"/>
+    </filter>
+  </defs>
+
+  <rect width="400" height="560" fill="#f5f5f5" rx="4"/>
+
+  <!-- 흐릿한 내용 (OCR 실패 케이스) -->
+  <g filter="url(#blur)" opacity="0.7">
+    <rect x="20" y="20" width="360" height="60" fill="#eee" rx="4"/>
+    <text x="200" y="55" font-family="Arial" font-size="16" font-weight="bold" text-anchor="middle" fill="#999">영 수 증</text>
+
+    <text x="30" y="115" font-family="Arial" font-size="13" fill="#aaa">상호명: ####### 마트</text>
+    <text x="30" y="138" font-family="Arial" font-size="12" fill="#aaa">사업자번호: ###-##-#####</text>
+    <text x="30" y="161" font-family="Arial" font-size="11" fill="#bbb">주소: ########## 123</text>
+
+    <line x1="20" y1="180" x2="380" y2="180" stroke="#ccc" stroke-width="1"/>
+
+    <text x="40" y="210" font-family="Arial" font-size="11" fill="#aaa">##### (##)</text>
+    <text x="230" y="210" font-family="Arial" font-size="11" fill="#aaa">2</text>
+    <text x="280" y="210" font-family="Arial" font-size="11" fill="#aaa">####원</text>
+
+    <text x="40" y="232" font-family="Arial" font-size="11" fill="#aaa">#### (###)</text>
+    <text x="230" y="232" font-family="Arial" font-size="11" fill="#aaa">1</text>
+    <text x="280" y="232" font-family="Arial" font-size="11" fill="#aaa">###원</text>
+
+    <rect x="20" y="260" width="360" height="36" fill="#999"/>
+    <text x="40" y="284" font-family="Arial" font-size="14" font-weight="bold" fill="#eee">합  계</text>
+    <text x="260" y="284" font-family="Arial" font-size="14" font-weight="bold" fill="#eee">####원</text>
+  </g>
+
+  <!-- 화질불량 안내 오버레이 -->
+  <rect x="60" y="380" width="280" height="80" fill="#fff9c4" rx="8" opacity="0.9"/>
+  <text x="200" y="410" font-family="Arial" font-size="13" font-weight="bold" text-anchor="middle" fill="#f57f17">⚠ 화질 불량 이미지</text>
+  <text x="200" y="432" font-family="Arial" font-size="11" text-anchor="middle" fill="#795548">OCR 인식 실패 테스트용</text>
+  <text x="200" y="450" font-family="Arial" font-size="11" text-anchor="middle" fill="#795548">사업자번호 추출 불가 예시</text>
+
+  <rect x="1" y="1" width="398" height="558" fill="none" stroke="#e0e0e0" stroke-width="1" rx="4"/>
+</svg>

@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>여신티켓 어드민 — 영수증 관리 (테스트)</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Apple SD Gothic Neo', sans-serif;
+      background: #f0f2f5;
+      color: #333;
+    }
+
+    /* ── 상단 네비게이션 ── */
+    .nav {
+      background: #1a237e;
+      color: white;
+      padding: 0 24px;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .nav-logo {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .nav-badge {
+      background: #ff4444;
+      color: white;
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 10px;
+      font-weight: 700;
+    }
+
+    .nav-menu {
+      display: flex;
+      gap: 4px;
+      margin-left: 16px;
+    }
+
+    .nav-menu a {
+      color: rgba(255,255,255,0.7);
+      text-decoration: none;
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-size: 13px;
+      transition: background 0.15s;
+    }
+
+    .nav-menu a:hover,
+    .nav-menu a.active {
+      background: rgba(255,255,255,0.15);
+      color: white;
+    }
+
+    .nav-right {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    /* ── 사이드바 + 메인 레이아웃 ── */
+    .layout {
+      display: flex;
+      min-height: calc(100vh - 56px);
+    }
+
+    .sidebar {
+      width: 220px;
+      background: white;
+      border-right: 1px solid #e0e0e0;
+      padding: 20px 0;
+      flex-shrink: 0;
+    }
+
+    .sidebar-section {
+      padding: 0 16px 16px;
+    }
+
+    .sidebar-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: #999;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+
+    .sidebar-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      color: #555;
+      transition: background 0.1s;
+      text-decoration: none;
+    }
+
+    .sidebar-item:hover {
+      background: #f5f5f5;
+      color: #333;
+    }
+
+    .sidebar-item.active {
+      background: #e8eaf6;
+      color: #1a237e;
+      font-weight: 600;
+    }
+
+    .sidebar-count {
+      margin-left: auto;
+      background: #ff4444;
+      color: white;
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 10px;
+    }
+
+    /* ── 메인 콘텐츠 ── */
+    .main {
+      flex: 1;
+      padding: 24px;
+      overflow-y: auto;
+    }
+
+    .page-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 20px;
+    }
+
+    .page-title {
+      font-size: 20px;
+      font-weight: 700;
+      color: #1a1a2e;
+    }
+
+    .page-subtitle {
+      font-size: 13px;
+      color: #888;
+      margin-top: 4px;
+    }
+
+    /* ── 필터 바 ── */
+    .filter-bar {
+      background: white;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 16px 20px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    .filter-bar select,
+    .filter-bar input {
+      padding: 7px 12px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      font-size: 13px;
+      outline: none;
+      color: #333;
+    }
+
+    .filter-bar select:focus,
+    .filter-bar input:focus {
+      border-color: #1a237e;
+    }
+
+    .btn {
+      padding: 7px 16px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      font-weight: 600;
+      transition: background 0.15s;
+    }
+
+    .btn-primary {
+      background: #1a237e;
+      color: white;
+    }
+
+    .btn-primary:hover { background: #283593; }
+
+    .btn-outline {
+      background: white;
+      color: #555;
+      border: 1px solid #ddd;
+    }
+
+    .btn-outline:hover { background: #f5f5f5; }
+
+    /* ── 영수증 테이블 ── */
+    .table-card {
+      background: white;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .table-card table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .table-card thead {
+      background: #f8f9ff;
+      border-bottom: 1px solid #e0e0e0;
+    }
+
+    .table-card th {
+      padding: 12px 16px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #666;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .table-card td {
+      padding: 16px;
+      font-size: 13px;
+      border-bottom: 1px solid #f0f0f0;
+      vertical-align: top;
+    }
+
+    .table-card tr:last-child td {
+      border-bottom: none;
+    }
+
+    .table-card tr:hover td {
+      background: #fafbff;
+    }
+
+    /* ── 영수증 이미지 셀 ── */
+    .receipt-image-cell {
+      width: 200px;
+    }
+
+    .receipt-img-wrapper {
+      position: relative;
+      display: inline-block;
+    }
+
+    .receipt-img-wrapper img {
+      width: 180px;
+      height: 240px;
+      object-fit: cover;
+      border: 1px solid #e0e0e0;
+      border-radius: 4px;
+      display: block;
+    }
+
+    /* ── 상태 뱃지 ── */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .badge-pending  { background: #fff3e0; color: #e65100; }
+    .badge-approved { background: #e8f5e9; color: #2e7d32; }
+    .badge-rejected { background: #ffebee; color: #c62828; }
+
+    /* ── 사용자 정보 ── */
+    .user-info {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .user-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: #e8eaf6;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      font-weight: 700;
+      color: #1a237e;
+      flex-shrink: 0;
+    }
+
+    .user-name { font-size: 13px; font-weight: 600; color: #333; }
+    .user-id   { font-size: 11px; color: #999; }
+
+    /* ── 액션 버튼 ── */
+    .action-cell {
+      white-space: nowrap;
+    }
+
+    .action-cell .btn {
+      padding: 5px 12px;
+      font-size: 12px;
+      margin-right: 4px;
+    }
+
+    /* ── 확장 안내 배너 ── */
+    .ext-banner {
+      background: linear-gradient(135deg, #1a237e 0%, #283593 100%);
+      color: white;
+      border-radius: 10px;
+      padding: 16px 20px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .ext-banner-icon { font-size: 28px; flex-shrink: 0; }
+
+    .ext-banner-title {
+      font-size: 14px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .ext-banner-desc {
+      font-size: 12px;
+      opacity: 0.85;
+      line-height: 1.5;
+    }
+
+    .ext-banner-steps {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+
+    .step-chip {
+      background: rgba(255,255,255,0.15);
+      border: 1px solid rgba(255,255,255,0.3);
+      border-radius: 16px;
+      padding: 4px 12px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    /* ── 테스트 케이스 라벨 ── */
+    .test-label {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    .test-label-pass    { background: #e8f5e9; color: #2e7d32; }
+    .test-label-fail    { background: #ffebee; color: #c62828; }
+    .test-label-caution { background: #fff3e0; color: #e65100; }
+
+    /* ── 통계 카드 ── */
+    .stat-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .stat-card {
+      background: white;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 16px 20px;
+    }
+
+    .stat-value {
+      font-size: 28px;
+      font-weight: 700;
+      color: #1a237e;
+    }
+
+    .stat-label {
+      font-size: 12px;
+      color: #888;
+      margin-top: 4px;
+    }
+
+    .stat-card.pending .stat-value  { color: #e65100; }
+    .stat-card.approved .stat-value { color: #2e7d32; }
+    .stat-card.rejected .stat-value { color: #c62828; }
+  </style>
+</head>
+<body>
+
+<!-- 상단 네비 -->
+<nav class="nav">
+  <span class="nav-logo">🎫 Yeoshin Admin</span>
+  <span class="nav-badge">TEST</span>
+  <div class="nav-menu">
+    <a href="#" class="active">영수증 관리</a>
+    <a href="#">회원 관리</a>
+    <a href="#">정산</a>
+    <a href="#">통계</a>
+  </div>
+  <div class="nav-right">
+    <span style="font-size:13px; color:rgba(255,255,255,0.8);">admin@yeoshin.co.kr</span>
+  </div>
+</nav>
+
+<div class="layout">
+  <!-- 사이드바 -->
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-title">영수증 관리</div>
+      <a class="sidebar-item active" href="#">
+        📋 전체 목록
+        <span class="sidebar-count">8</span>
+      </a>
+      <a class="sidebar-item" href="#">⏳ 검토 대기 <span class="sidebar-count">3</span></a>
+      <a class="sidebar-item" href="#">✅ 승인 완료</a>
+      <a class="sidebar-item" href="#">❌ 반려 처리</a>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-title">도구</div>
+      <a class="sidebar-item" href="#">📊 통계 리포트</a>
+      <a class="sidebar-item" href="#">⚙️ 설정</a>
+    </div>
+  </aside>
+
+  <!-- 메인 -->
+  <main class="main">
+    <div class="page-header">
+      <div>
+        <div class="page-title">영수증 검토 관리</div>
+        <div class="page-subtitle">사용자 제출 영수증을 검토하고 승인/반려 처리합니다.</div>
+      </div>
+      <button class="btn btn-primary">+ 일괄 처리</button>
+    </div>
+
+    <!-- 확장 프로그램 안내 배너 -->
+    <div class="ext-banner">
+      <div class="ext-banner-icon">🔍</div>
+      <div style="flex:1">
+        <div class="ext-banner-title">Yeoshin Receipt Guard 확장 프로그램 테스트 페이지</div>
+        <div class="ext-banner-desc">
+          각 영수증 이미지 위에 마우스를 올리면 <strong>[🔍 영수증 검증]</strong> 버튼이 나타납니다.
+          버튼을 클릭하면 OCR · EXIF · 국세청 API 3중 자동 검증이 실행됩니다.
+        </div>
+        <div class="ext-banner-steps">
+          <span class="step-chip">1. chrome://extensions 에서 확장 로드</span>
+          <span class="step-chip">2. 옵션 → API Key 입력</span>
+          <span class="step-chip">3. 아래 영수증 버튼 클릭 테스트</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 통계 카드 -->
+    <div class="stat-row">
+      <div class="stat-card">
+        <div class="stat-value">8</div>
+        <div class="stat-label">전체 제출</div>
+      </div>
+      <div class="stat-card pending">
+        <div class="stat-value">3</div>
+        <div class="stat-label">검토 대기</div>
+      </div>
+      <div class="stat-card approved">
+        <div class="stat-value">4</div>
+        <div class="stat-label">승인 완료</div>
+      </div>
+      <div class="stat-card rejected">
+        <div class="stat-value">1</div>
+        <div class="stat-label">반려 처리</div>
+      </div>
+    </div>
+
+    <!-- 필터 바 -->
+    <div class="filter-bar">
+      <select>
+        <option>전체 상태</option>
+        <option>검토 대기</option>
+        <option>승인 완료</option>
+        <option>반려 처리</option>
+      </select>
+      <input type="text" placeholder="사용자 ID 또는 이름 검색" style="width:220px;">
+      <input type="date" value="2026-03-01">
+      <span style="color:#aaa;">~</span>
+      <input type="date" value="2026-03-23">
+      <button class="btn btn-primary">검색</button>
+      <button class="btn btn-outline">초기화</button>
+    </div>
+
+    <!-- 영수증 목록 테이블 -->
+    <div class="table-card">
+      <table>
+        <thead>
+          <tr>
+            <th><input type="checkbox"></th>
+            <th>제출자</th>
+            <th>영수증 이미지</th>
+            <th>제출일시</th>
+            <th>금액</th>
+            <th>상태</th>
+            <th>액션</th>
+          </tr>
+        </thead>
+        <tbody>
+
+          <!-- ── 케이스 1: 정상 영수증 (계속사업자) ── -->
+          <tr>
+            <td><input type="checkbox"></td>
+            <td>
+              <div class="user-info">
+                <div class="user-avatar">김</div>
+                <div>
+                  <div class="user-name">김미래</div>
+                  <div class="user-id">ID: user_001</div>
+                </div>
+              </div>
+            </td>
+            <td class="receipt-image-cell">
+              <span class="test-label test-label-pass">예상: 🟢 정상</span><br>
+              <div class="receipt-img-wrapper">
+                <img
+                  src="images/receipt-normal.svg"
+                  alt="영수증"
+                  title="테스트 케이스 1: 정상 영수증 (사업자번호: 123-45-67890)"
+                >
+              </div>
+              <div style="font-size:11px; color:#888; margin-top:6px;">사업자번호: 123-45-67890</div>
+            </td>
+            <td>2026-03-23<br><span style="color:#999; font-size:12px;">14:30</span></td>
+            <td style="font-weight:600;">6,500원</td>
+            <td><span class="badge badge-pending">⏳ 대기</span></td>
+            <td class="action-cell">
+              <button class="btn btn-primary" onclick="handleApprove(1)">승인</button>
+              <button class="btn btn-outline" onclick="handleReject(1)">반려</button>
+            </td>
+          </tr>
+
+          <!-- ── 케이스 2: 폐업 사업자 영수증 ── -->
+          <tr>
+            <td><input type="checkbox"></td>
+            <td>
+              <div class="user-info">
+                <div class="user-avatar">이</div>
+                <div>
+                  <div class="user-name">이성호</div>
+                  <div class="user-id">ID: user_002</div>
+                </div>
+              </div>
+            </td>
+            <td class="receipt-image-cell">
+              <span class="test-label test-label-fail">예상: 🔴 반려 (폐업)</span><br>
+              <div class="receipt-img-wrapper">
+                <img
+                  src="images/receipt-closed.svg"
+                  alt="영수증"
+                  title="테스트 케이스 2: 폐업 사업자 영수증 (사업자번호: 987-65-43210)"
+                >
+              </div>
+              <div style="font-size:11px; color:#888; margin-top:6px;">사업자번호: 987-65-43210</div>
+            </td>
+            <td>2026-03-22<br><span style="color:#999; font-size:12px;">09:15</span></td>
+            <td style="font-weight:600;">7,800원</td>
+            <td><span class="badge badge-pending">⏳ 대기</span></td>
+            <td class="action-cell">
+              <button class="btn btn-primary" onclick="handleApprove(2)">승인</button>
+              <button class="btn btn-outline" onclick="handleReject(2)">반려</button>
+            </td>
+          </tr>
+
+          <!-- ── 케이스 3: 화질불량 (OCR 실패) ── -->
+          <tr>
+            <td><input type="checkbox"></td>
+            <td>
+              <div class="user-info">
+                <div class="user-avatar">박</div>
+                <div>
+                  <div class="user-name">박정아</div>
+                  <div class="user-id">ID: user_003</div>
+                </div>
+              </div>
+            </td>
+            <td class="receipt-image-cell">
+              <span class="test-label test-label-caution">예상: 🟡 주의 (OCR실패)</span><br>
+              <div class="receipt-img-wrapper">
+                <img
+                  src="images/receipt-blur.svg"
+                  alt="영수증"
+                  title="테스트 케이스 3: 화질 불량 영수증 (OCR 인식 불가)"
+                >
+              </div>
+              <div style="font-size:11px; color:#888; margin-top:6px;">화질불량 — 사업자번호 불명</div>
+            </td>
+            <td>2026-03-21<br><span style="color:#999; font-size:12px;">16:45</span></td>
+            <td style="font-weight:600;">12,000원</td>
+            <td><span class="badge badge-pending">⏳ 대기</span></td>
+            <td class="action-cell">
+              <button class="btn btn-primary" onclick="handleApprove(3)">승인</button>
+              <button class="btn btn-outline" onclick="handleReject(3)">반려</button>
+            </td>
+          </tr>
+
+          <!-- ── 케이스 4: 동적 추가 영수증 (JS 생성) ── -->
+          <tr id="dynamic-row" style="display:none;">
+            <td><input type="checkbox"></td>
+            <td>
+              <div class="user-info">
+                <div class="user-avatar">최</div>
+                <div>
+                  <div class="user-name">최동적</div>
+                  <div class="user-id">ID: user_004</div>
+                </div>
+              </div>
+            </td>
+            <td class="receipt-image-cell" id="dynamic-img-cell">
+              <span class="test-label test-label-pass">예상: 🟢 동적 주입 테스트</span><br>
+            </td>
+            <td>2026-03-23<br><span style="color:#999; font-size:12px;">실시간</span></td>
+            <td style="font-weight:600;">5,000원</td>
+            <td><span class="badge badge-pending">⏳ 대기</span></td>
+            <td class="action-cell">
+              <button class="btn btn-primary">승인</button>
+              <button class="btn btn-outline">반려</button>
+            </td>
+          </tr>
+
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 동적 주입 테스트 버튼 -->
+    <div style="margin-top: 20px; padding: 16px 20px; background: white; border: 1px solid #e0e0e0; border-radius: 8px;">
+      <div style="font-size:14px; font-weight:700; margin-bottom:12px; color:#333;">
+        🧪 MutationObserver 테스트 — 동적 이미지 주입
+      </div>
+      <div style="font-size:13px; color:#666; margin-bottom:12px;">
+        아래 버튼을 클릭하면 DOM에 새로운 영수증 이미지가 동적으로 추가됩니다.<br>
+        확장 프로그램이 <code>MutationObserver</code>로 이를 감지하여 자동으로 검증 버튼을 주입해야 합니다.
+      </div>
+      <button class="btn btn-primary" onclick="addDynamicReceipt()">
+        + 영수증 동적 추가
+      </button>
+      <button class="btn btn-outline" style="margin-left:8px;" onclick="clearDynamic()">
+        초기화
+      </button>
+      <div id="dynamic-status" style="margin-top:10px; font-size:12px; color:#888;"></div>
+    </div>
+
+  </main>
+</div>
+
+<script>
+  function handleApprove(id) {
+    if (confirm(`영수증 #${id}을 승인하시겠습니까?`)) {
+      alert('승인 처리되었습니다.');
+    }
+  }
+
+  function handleReject(id) {
+    const reason = prompt('반려 사유를 입력하세요:');
+    if (reason) {
+      alert(`반려 처리되었습니다.\n사유: ${reason}`);
+    }
+  }
+
+  let dynamicCount = 0;
+
+  function addDynamicReceipt() {
+    dynamicCount++;
+    const cell = document.getElementById('dynamic-img-cell');
+    const row = document.getElementById('dynamic-row');
+
+    row.style.display = '';
+
+    const wrapper = document.createElement('div');
+    wrapper.style.marginTop = '8px';
+
+    const img = document.createElement('img');
+    img.src = 'images/receipt-normal.svg';
+    img.alt = '영수증';
+    img.style.width = '180px';
+    img.style.height = '240px';
+    img.style.objectFit = 'cover';
+    img.style.border = '1px solid #e0e0e0';
+    img.style.borderRadius = '4px';
+    img.style.display = 'block';
+    img.title = `동적 추가 영수증 #${dynamicCount}`;
+
+    wrapper.appendChild(img);
+    cell.appendChild(wrapper);
+
+    const status = document.getElementById('dynamic-status');
+    status.textContent = `✅ 영수증 이미지 #${dynamicCount} 동적 추가 완료 — 확장 프로그램이 자동으로 [🔍 영수증 검증] 버튼을 주입해야 합니다.`;
+    status.style.color = '#2e7d32';
+  }
+
+  function clearDynamic() {
+    dynamicCount = 0;
+    document.getElementById('dynamic-row').style.display = 'none';
+    const cell = document.getElementById('dynamic-img-cell');
+    cell.innerHTML = '<span class="test-label test-label-pass">예상: 🟢 동적 주입 테스트</span><br>';
+    document.getElementById('dynamic-status').textContent = '';
+  }
+</script>
+</body>
+</html>

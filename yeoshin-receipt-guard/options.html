@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Yeoshin Receipt Guard — 설정</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Apple SD Gothic Neo', sans-serif;
+      background: #f5f7fa;
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 40px 20px;
+    }
+
+    .container {
+      background: white;
+      border-radius: 12px;
+      padding: 32px;
+      width: 100%;
+      max-width: 520px;
+      box-shadow: 0 2px 16px rgba(0,0,0,0.08);
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 28px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid #eee;
+    }
+
+    .header h1 {
+      font-size: 18px;
+      font-weight: 700;
+      color: #1a1a2e;
+    }
+
+    .header .version {
+      font-size: 12px;
+      color: #999;
+      margin-top: 2px;
+    }
+
+    .section {
+      margin-bottom: 24px;
+    }
+
+    .section label {
+      display: block;
+      font-size: 14px;
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 8px;
+    }
+
+    .section input[type="text"],
+    .section input[type="password"] {
+      width: 100%;
+      padding: 10px 14px;
+      border: 1.5px solid #ddd;
+      border-radius: 8px;
+      font-size: 14px;
+      color: #333;
+      transition: border-color 0.2s;
+      outline: none;
+    }
+
+    .section input:focus {
+      border-color: #2196F3;
+    }
+
+    .help-text {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #888;
+      line-height: 1.6;
+    }
+
+    .help-text a {
+      color: #2196F3;
+      text-decoration: none;
+    }
+
+    .help-text a:hover {
+      text-decoration: underline;
+    }
+
+    .toggle-visibility {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .toggle-visibility input[type="checkbox"] {
+      cursor: pointer;
+    }
+
+    .toggle-visibility label {
+      font-size: 12px;
+      color: #666;
+      cursor: pointer;
+      margin: 0;
+      font-weight: normal;
+    }
+
+    .btn-save {
+      width: 100%;
+      padding: 12px;
+      background: #2196F3;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-top: 8px;
+    }
+
+    .btn-save:hover { background: #1976D2; }
+    .btn-save:active { background: #1565C0; }
+
+    #statusMsg {
+      margin-top: 12px;
+      font-size: 13px;
+      min-height: 20px;
+      text-align: center;
+    }
+
+    .status-success { color: #4CAF50; }
+    .status-error   { color: #f44336; }
+
+    .info-box {
+      background: #e3f2fd;
+      border: 1px solid #90caf9;
+      border-radius: 8px;
+      padding: 14px;
+      margin-top: 24px;
+    }
+
+    .info-box h3 {
+      font-size: 13px;
+      font-weight: 700;
+      color: #1565C0;
+      margin-bottom: 8px;
+    }
+
+    .info-box ol {
+      padding-left: 18px;
+      font-size: 12px;
+      color: #1976D2;
+      line-height: 1.8;
+    }
+
+    .divider {
+      border: none;
+      border-top: 1px solid #eee;
+      margin: 24px 0;
+    }
+
+    .domain-section .domain-list {
+      font-size: 12px;
+      color: #666;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <span style="font-size:28px;">🔍</span>
+      <div>
+        <h1>Yeoshin Receipt Guard</h1>
+        <div class="version">v1.0.0 — 영수증 자동 검증 설정</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <label for="apiKey">공공데이터포털 API Key</label>
+      <input type="password" id="apiKey" placeholder="발급받은 API Key를 입력하세요" autocomplete="off">
+      <div class="toggle-visibility">
+        <input type="checkbox" id="showKey">
+        <label for="showKey">API Key 표시</label>
+      </div>
+      <p class="help-text">
+        공공데이터포털(<a href="https://www.data.go.kr" target="_blank">data.go.kr</a>)에서
+        <strong>국세청_사업자등록정보 진위확인 및 상태조회 서비스</strong> API를 신청 후
+        발급받은 인증키를 입력하세요.
+      </p>
+    </div>
+
+    <div class="section">
+      <label for="geminiApiKey">Gemini API Key <span style="font-weight:normal;color:#c0392b;">(OCR에 필수)</span></label>
+      <input type="password" id="geminiApiKey" placeholder="AIza..." autocomplete="off">
+      <div class="toggle-visibility">
+        <input type="checkbox" id="showGeminiKey">
+        <label for="showGeminiKey">Gemini API Key 표시</label>
+      </div>
+      <p class="help-text">
+        영수증 OCR에 Gemini Vision API를 사용합니다. 미설정 시 사업자번호를 인식할 수 없습니다.<br>
+        모델: <strong>gemini-2.0-flash-lite</strong> (가성비 최적) —
+        <a href="https://aistudio.google.com/app/apikey" target="_blank">API Key 발급</a>
+      </p>
+    </div>
+
+    <button class="btn-save" id="saveBtn">저장</button>
+    <div id="statusMsg"></div>
+
+    <div class="info-box">
+      <h3>API Key 발급 방법</h3>
+      <ol>
+        <li>공공데이터포털 (data.go.kr) 회원가입/로그인</li>
+        <li>"국세청_사업자등록정보 진위확인" 검색</li>
+        <li>"활용신청" 버튼 클릭 후 신청</li>
+        <li>승인 후 마이페이지 → 개발계정 → 인증키 복사</li>
+        <li>위 입력란에 붙여넣기 후 저장</li>
+      </ol>
+    </div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
