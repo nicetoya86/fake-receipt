@@ -89,6 +89,9 @@ function injectVerifyButton(imgEl) {
   button.className = 'yrg-verify-btn';
   button.innerHTML = '🔍 영수증 검증';
   button.title = 'Yeoshin Receipt Guard — 클릭하여 검증 시작';
+  button.addEventListener('mousedown', () => {
+    chrome.runtime.sendMessage({ type: 'PING' });
+  }, { passive: true });
   button.addEventListener('click', (e) => {
     // stopPropagation 미사용 — 어드민 클릭 핸들러를 차단하지 않음
     e.preventDefault();
@@ -215,14 +218,9 @@ async function analyzeEXIF(imgEl) {
         const foundTool = EDIT_TOOLS.find(tool => allSoftware.includes(tool));
 
         const allTags = EXIF.getAllTags(this);
-        // JPEG인데 EXIF 태그가 전혀 없으면 그림판·기본 편집 도구로 재저장됐을 가능성 있음
-        const isJpeg = imgEl.src?.match(/\.jpe?g(\?|$)/i) ||
-                       imgEl.currentSrc?.match(/\.jpe?g(\?|$)/i);
-        const isExifStripped = isJpeg && Object.keys(allTags).length === 0;
 
         resolve({
           isTampered: !!foundTool,
-          isExifStripped: !!isExifStripped,
           software: foundTool ? (software || processingSoftware) : null,
           allTags
         });
@@ -276,8 +274,9 @@ async function analyzeImageNoise(dataURL) {
         const rows = Math.floor(h / BLOCK);
         if (cols < 3 || rows < 3) return resolve({ isPaintSuspect: false });
 
-        // 블록별 분산 계산
-        const varGrid = Array.from({ length: rows }, () => new Float32Array(cols));
+        // 블록별 분산 + 평균 밝기 계산
+        const varGrid  = Array.from({ length: rows }, () => new Float32Array(cols));
+        const meanGrid = Array.from({ length: rows }, () => new Float32Array(cols));
         for (let br = 0; br < rows; br++) {
           for (let bc = 0; bc < cols; bc++) {
             let sum = 0;
@@ -290,37 +289,118 @@ async function analyzeImageNoise(dataURL) {
               }
             }
             const mean = sum / vals.length;
+            meanGrid[br][bc] = mean;
             varGrid[br][bc] = vals.reduce((s, v) => s + (v - mean) ** 2, 0) / vals.length;
           }
         }
 
-        // 주변(8방향) 대비 비정상적으로 평탄한 블록 탐지
-        let suspiciousBlocks = 0;
-        for (let br = 1; br < rows - 1; br++) {
-          for (let bc = 1; bc < cols - 1; bc++) {
+        // 기울어진 영수증 가장자리 배경 노출 제외: 이미지 크기의 10% 테두리 제거
+        const borderRows = Math.max(2, Math.round(rows * 0.10));
+        const borderCols = Math.max(2, Math.round(cols * 0.10));
+
+        // 1차: 후보 블록 탐지 (주변 8방향 대비 극도로 평탄한 블록)
+        const suspicious = Array.from({ length: rows }, () => new Uint8Array(cols));
+        for (let br = borderRows; br < rows - borderRows; br++) {
+          for (let bc = borderCols; bc < cols - borderCols; bc++) {
             const v = varGrid[br][bc];
-            if (v > 1.5) continue; // 충분히 평탄하지 않으면 스킵
+            if (v > 1.5) continue;
             const neighborMean = (
               varGrid[br-1][bc-1] + varGrid[br-1][bc] + varGrid[br-1][bc+1] +
               varGrid[br  ][bc-1]                     + varGrid[br  ][bc+1] +
               varGrid[br+1][bc-1] + varGrid[br+1][bc] + varGrid[br+1][bc+1]
             ) / 8;
-            // 주변이 텍스처 있는데 이 블록만 극도로 평탄 = 그림판 채우기 흔적
-            if (neighborMean > 20 && v < 0.8) suspiciousBlocks++;
+            if (neighborMean > 20 && v < 0.8) suspicious[br][bc] = 1;
           }
         }
 
-        const totalInner = (rows - 2) * (cols - 2);
+        // 2차: 클러스터 필터 + 밝기 수집 — 인접 의심 블록 없는 고립 블록 제외
+        let suspiciousBlocks = 0;
+        let brightSum = 0, brightCount = 0;
+        for (let br = borderRows; br < rows - borderRows; br++) {
+          for (let bc = borderCols; bc < cols - borderCols; bc++) {
+            if (!suspicious[br][bc]) continue;
+            const hasNeighbor = suspicious[br-1][bc] || suspicious[br+1][bc] ||
+                                 suspicious[br][bc-1] || suspicious[br][bc+1];
+            if (!hasNeighbor) continue;
+            suspiciousBlocks++;
+            // 해당 블록 중심 픽셀 밝기 샘플링
+            const cy = (br * BLOCK + BLOCK / 2) | 0;
+            const cx = (bc * BLOCK + BLOCK / 2) | 0;
+            const idx = (cy * w + cx) * 4;
+            brightSum += data[idx] * 0.299 + data[idx+1] * 0.587 + data[idx+2] * 0.114;
+            brightCount++;
+          }
+        }
+
+        const totalInner = (rows - 2 * borderRows) * (cols - 2 * borderCols);
         const ratio = suspiciousBlocks / Math.max(1, totalInner);
-        // 내부 블록의 4% 이상이 의심스럽고 절대 수 3개 이상이면 플래그
         const isPaintSuspect = ratio > 0.04 && suspiciousBlocks >= 3;
-        console.log('[YRG] 노이즈 분석: 의심 블록', suspiciousBlocks, '/', totalInner, `(${Math.round(ratio*100)}%)`);
-        resolve({ isPaintSuspect, suspiciousBlocks, ratio: Math.round(ratio * 100) });
+
+        // 편집 유형 힌트: 의심 블록 평균 밝기로 흰색 덮어쓰기(교체) vs 어두운 가림(은닉) 구분
+        let editHint = null;
+        if (suspiciousBlocks >= 3) {
+          const avgBright = brightCount > 0 ? brightSum / brightCount : 0;
+          editHint = avgBright > 220 ? '교체' : '은닉';
+        }
+
+        // 흰색 덮어쓰기 전용 탐지 — JPEG 압축 허용 (absolute threshold 대신 이웃 대비 상대 비율)
+        // 기존 suspicious(분산<0.8)와 독립적 패스: 밝기>215 + 분산이 이웃 대비 12% 미만 + 이웃 평균 분산>20
+        const brightSusp = Array.from({ length: rows }, () => new Uint8Array(cols));
+        for (let br = borderRows; br < rows - borderRows; br++) {
+          for (let bc = borderCols; bc < cols - borderCols; bc++) {
+            if (meanGrid[br][bc] < 215) continue;
+            const v = varGrid[br][bc];
+            const neighborMean = (
+              varGrid[br-1][bc-1] + varGrid[br-1][bc] + varGrid[br-1][bc+1] +
+              varGrid[br  ][bc-1]                     + varGrid[br  ][bc+1] +
+              varGrid[br+1][bc-1] + varGrid[br+1][bc] + varGrid[br+1][bc+1]
+            ) / 8;
+            // 이웃 분산이 충분히 높고(텍스처), 현재 블록이 이웃 대비 매우 균일한 경우
+            if (neighborMean > 20 && v < neighborMean * 0.12) brightSusp[br][bc] = 1;
+          }
+        }
+        let brightBlocks = 0;
+        for (let br = borderRows; br < rows - borderRows; br++) {
+          for (let bc = borderCols; bc < cols - borderCols; bc++) {
+            if (!brightSusp[br][bc]) continue;
+            const hasNeighbor = brightSusp[br-1][bc] || brightSusp[br+1][bc] ||
+                                 brightSusp[br][bc-1] || brightSusp[br][bc+1];
+            if (hasNeighbor) brightBlocks++;
+          }
+        }
+        // 면적 비율(4%) 미달이라도 흰색 균일 클러스터 5개 이상이면 국소 흰색 교체 의심
+        const isWhiteEditSuspect = brightBlocks >= 5;
+
+        console.log('[YRG] 노이즈 분석: 의심블록', suspiciousBlocks, '/', totalInner, `(${Math.round(ratio*100)}%)`, `밝은클러스터:${brightBlocks}`, `흰색교체의심:${isWhiteEditSuspect}`, editHint ? `편집힌트:${editHint}` : '');
+        resolve({ isPaintSuspect, isWhiteEditSuspect, suspiciousBlocks, brightBlocks, ratio: Math.round(ratio * 100), editHint });
       } catch (e) {
         resolve({ isPaintSuspect: false, error: e.message });
       }
     };
     img.onerror = () => resolve({ isPaintSuspect: false });
+    img.src = dataURL;
+  });
+}
+
+// Gemini 전송용 이미지 압축 — 최대 1280px + JPEG 변환 (픽셀 분석용 원본과 분리)
+function compressImageForGemini(dataURL) {
+  const MAX = 1280;
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const w = img.naturalWidth || img.width;
+      const h = img.naturalHeight || img.height;
+      const scale = Math.min(1, MAX / Math.max(w, h, 1));
+      if (scale === 1 && dataURL.startsWith('data:image/jpeg')) { resolve(dataURL); return; }
+      const canvas = document.createElement('canvas');
+      canvas.width  = Math.round(w * scale);
+      canvas.height = Math.round(h * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      const compressed = canvas.toDataURL('image/jpeg', 0.88);
+      console.log('[YRG] Gemini 이미지 압축:', dataURL.length, '→', compressed.length, `(${Math.round(compressed.length / dataURL.length * 100)}%)`);
+      resolve(compressed);
+    };
+    img.onerror = () => resolve(dataURL);
     img.src = dataURL;
   });
 }
@@ -344,7 +424,7 @@ async function runOCR(dataURL) {
         reject(new Error(response?.error || 'OCR 실패'));
         return;
       }
-      resolve({ text: response.text, approvalNo: response.approvalNo || null });
+      resolve({ text: response.text, approvalNo: response.approvalNo || null, cardBIN: response.cardBIN || null, isReceipt: response.isReceipt !== false });
     });
   });
 }
@@ -452,132 +532,161 @@ async function verifyBusinessNumber(bizNo) {
   });
 }
 
-// ── 7. 결과 판정 로직 ───────────────────────────────────────
+// ── 7. 순차 검증 단계 함수 ──────────────────────────────────────
 
-function judgeResult(exifResult, ocrResult, apiResult, hashResult, tamperResult, binResult) {
-  const reasons = [];
+// 1단계: 사업자등록번호 계속사업자 확인
+async function step1BizNo(bizNo) {
+  if (!bizNo) return { pass: true };
+  try {
+    const api = await verifyBusinessNumber(bizNo);
+    if (!api.success) {
+      const msg = api.error === 'NO_API_KEY'
+        ? '[1단계] 사업자 검증 불가 — API Key 미설정 (옵션에서 설정해 주세요)'
+        : `[1단계] 사업자 검증 실패 — 국세청 API 오류: ${api.message || '알 수 없는 오류'}`;
+      return { pass: false, verdict: { status: 'reject', icon: '🔴', title: '반려', reasons: [msg] } };
+    }
+    if (api.status !== 'active') {
+      const reasons = [`[1단계] 사업자 검증 실패 — 사업자 상태: ${api.statusText}`];
+      if (api.bizNo) reasons.push(`사업자번호: ${api.bizNo}`);
+      if (api.endDate) reasons.push(`폐업일: ${api.endDate}`);
+      return { pass: false, verdict: { status: 'reject', icon: '🔴', title: '반려', reasons } };
+    }
+    return { pass: true };
+  } catch (err) {
+    return { pass: false, verdict: { status: 'reject', icon: '🔴', title: '반려', reasons: [`[1단계] 사업자 검증 오류: ${err.message}`] } };
+  }
+}
 
-  // 🔴 반려 (우선순위 1): EXIF 위변조 감지
-  if (exifResult && exifResult.isTampered) {
+// 2단계: 카드 BIN 규칙 검증
+async function step2CardBIN(bin) {
+  if (!bin) return { pass: true };
+  const result = await checkCardBIN(bin).catch(() => ({ valid: true, skip: true }));
+  if (result.valid === false) {
     return {
-      status: 'reject',
-      icon: '🔴',
-      title: '반려',
-      reasons: [`이미지 편집 흔적 감지: ${exifResult.software}`]
+      pass: false,
+      verdict: {
+        status: 'reject', icon: '🔴', title: '반려',
+        reasons: [`[2단계] 카드번호 검증 실패 — ${result.reason || '유효하지 않은 카드번호'}${result.bin ? ` (BIN: ${result.bin})` : ''}`]
+      }
+    };
+  }
+  return { pass: true };
+}
+
+// 3단계: 이미지 위변조 탐지 (EXIF + 픽셀 노이즈 + 중복 해시 + Gemini)
+async function step3Tamper(imgEl, dataURL, hashInfo, preloaded = {}) {
+  const exifResult = await (preloaded.exif || analyzeEXIF(imgEl).catch(() => ({ isTampered: false, error: true })));
+  if (exifResult.isTampered) {
+    return {
+      pass: false,
+      verdict: { status: 'reject', icon: '🔴', title: '반려', reasons: [`[3단계] 위변조 탐지 — 이미지 편집 흔적 감지: ${exifResult.software}`] }
     };
   }
 
-  // 🟡 주의 (우선순위 1-b): JPEG EXIF 완전 제거 — 그림판 등으로 재저장됐을 가능성
-  if (exifResult && exifResult.isExifStripped) {
+  // 픽셀 노이즈 + 중복 해시 병렬 처리
+  const [noiseResult, dupResult] = await Promise.all([
+    preloaded.noise || analyzeImageNoise(dataURL).catch(() => ({ isPaintSuspect: false })),
+    (hashInfo.hash || hashInfo.approvalNo)
+      ? compareHash(hashInfo.hash, hashInfo.approvalNo).catch(() => ({ isDuplicate: false }))
+      : Promise.resolve({ isDuplicate: false })
+  ]);
+
+  if (dupResult.isDuplicate) {
+    const prevDate = dupResult.savedAt ? new Date(dupResult.savedAt).toLocaleString('ko-KR') : '알 수 없음';
+    const reason = dupResult.reason === 'approvalNo' ? '승인번호 일치' : '이미지 유사도 일치';
     return {
-      status: 'caution',
-      icon: '🟡',
-      title: '주의',
-      reasons: ['JPEG 메타데이터(EXIF)가 완전히 제거됨 — 그림판 등 기본 편집 도구로 재저장됐을 수 있습니다. 수동 검토를 권장합니다.']
+      pass: false,
+      verdict: { status: 'reject', icon: '🔴', title: '반려', reasons: [`[3단계] 위변조 탐지 — 중복 영수증 (${reason}) — 이전 검증: ${prevDate}`] }
     };
   }
 
-  // 🔴 반려 (우선순위 2): AI 위변조 고신뢰 OR 도용 고신뢰 OR AI생성 고신뢰
-  if (tamperResult) {
-    const highTamper = tamperResult.tamperLevel === 'high';
-    const highStolen = tamperResult.isSuspectedStolen && tamperResult.tamperLevel !== 'low';
-    const highAI     = tamperResult.isSuspectedAI     && tamperResult.tamperLevel !== 'low';
+  const tamperResult = await (preloaded.tamper || analyzeTamper(dataURL).catch(() => ({ tamperLevel: 'unknown', error: true })));
 
-    if (highTamper || highStolen || highAI) {
-      const rejectReasons = [];
-      if (highTamper) rejectReasons.push(`AI 위변조 감지 (신뢰도: ${tamperResult.score}점/100) — ${tamperResult.reason}`);
-      if (highStolen) rejectReasons.push('화면 캡처/도용 의심 — 실제 촬영 영수증이 아닐 수 있습니다');
-      if (highAI)     rejectReasons.push('AI 생성 이미지 의심 — 생성형 AI로 만든 영수증일 수 있습니다');
-      return { status: 'reject', icon: '🔴', title: '반려', reasons: rejectReasons };
+  // ── 편집 위치·유형 분류 판정 (주 신호: Gemini, 보조 신호: 픽셀 시그니처) ──────
+  const { editLocation, editType } = tamperResult;
+
+  if (editLocation === '거래핵심정보') {
+    return {
+      pass: false,
+      verdict: { status: 'reject', icon: '🔴', title: '반려',
+        reasons: [`[3단계] 위변조 탐지 — 거래 핵심 정보(거래일시·금액·가맹점 등)가 편집된 흔적이 있습니다. (편집유형: ${editType})`] }
+    };
+  }
+  if (editLocation === '카드정보' && editType === '교체') {
+    return {
+      pass: false,
+      verdict: { status: 'reject', icon: '🔴', title: '반려',
+        reasons: ['[3단계] 위변조 탐지 — 카드 정보가 교체 편집된 흔적이 있습니다.'] }
+    };
+  }
+  // 카드정보 + 은닉 → 개인정보 보호 처리로 간주, tamperLevel 판정으로 진행
+
+  // 픽셀 시그니처 보조 신호 — Gemini 편집부위 미감지 시에만 활용
+  if ((noiseResult.isPaintSuspect || noiseResult.isWhiteEditSuspect) && editLocation === '없음') {
+    const paintReason = noiseResult.isWhiteEditSuspect
+      ? `픽셀 분석: 흰색 덮어쓰기 편집 의심 — 텍스처 영역 안에 균일한 흰색 블록 ${noiseResult.brightBlocks}개 감지`
+      : `픽셀 분석: 편집 도구로 지워진 영역 의심 (이상 블록 ${noiseResult.suspiciousBlocks}개, ${noiseResult.ratio}%)`;
+    console.log('[YRG]', paintReason);
+    const geminiClean = tamperResult.score === 0 && tamperResult.verdict === '정상';
+    const whiteOverwriteDetected = noiseResult.isWhiteEditSuspect;
+    if (whiteOverwriteDetected || (!geminiClean && (!tamperResult.tamperLevel || tamperResult.tamperLevel === 'low' || tamperResult.tamperLevel === 'unknown'))) {
+      tamperResult.tamperLevel = 'medium';
+      if (whiteOverwriteDetected) {
+        // 픽셀이 주 반려 근거 — Gemini 이유 덮어쓰기, score 표시 제거
+        tamperResult.reason = paintReason;
+        tamperResult.score = null;
+        tamperResult.editType = '교체';
+      } else {
+        tamperResult.reason = tamperResult.reason && tamperResult.reason !== '이상 없음'
+          ? `${tamperResult.reason} / ${paintReason}`
+          : paintReason;
+      }
     }
   }
 
-  // 🔴 반려 (우선순위 3): 중복 영수증 감지 (approved 항목과 일치)
-  if (hashResult && hashResult.isDuplicate) {
-    const prevDate = hashResult.savedAt
-      ? new Date(hashResult.savedAt).toLocaleString('ko-KR')
-      : '알 수 없음';
-    const reason = hashResult.reason === 'approvalNo' ? '승인번호 일치' : '이미지 유사도 일치';
+  if (tamperResult.isMultipleReceipts) {
     return {
-      status: 'reject',
-      icon: '🔴',
-      title: '반려',
-      reasons: [`중복 영수증 감지 (${reason}) — 이전 검증 일시: ${prevDate}`]
+      pass: false,
+      verdict: { status: 'reject', icon: '🔴', title: '반려',
+        reasons: ['[3단계] 검증 불가 — 이미지에 영수증이 여러 장 포함되어 있습니다. 영수증 1장씩 업로드해 주세요.'] }
     };
   }
 
-  // 🔴 반려 (우선순위 4): 유효하지 않은 카드 BIN
-  if (binResult && binResult.valid === false) {
+  if (tamperResult.tamperLevel === 'high' || tamperResult.tamperLevel === 'medium') {
     return {
-      status: 'reject',
-      icon: '🔴',
-      title: '반려',
-      reasons: [`${binResult.reason || '유효하지 않은 카드번호'}${binResult.bin ? ` (BIN: ${binResult.bin})` : ''}`]
+      pass: false,
+      verdict: { status: 'reject', icon: '🔴', title: '반려', reasons: [tamperResult.score != null ? `[3단계] 위변조 탐지 — ${tamperResult.reason} (신뢰도: ${tamperResult.score}점/100)` : `[3단계] 위변조 탐지 — ${tamperResult.reason}`] },
+      tamperResult
     };
   }
 
-  // 🔴 반려 (우선순위 5): 국세청 API — 폐업/미등록/휴업
-  if (apiResult && apiResult.success) {
-    if (['closed', 'unregistered', 'suspended'].includes(apiResult.status)) {
-      const reasons = [`사업자 상태: ${apiResult.statusText}`];
-      if (apiResult.bizNo) reasons.push(`사업자번호: ${apiResult.bizNo}`);
-      if (apiResult.endDate) reasons.push(`폐업일: ${apiResult.endDate}`);
-      return { status: 'reject', icon: '🔴', title: '반려', reasons };
-    }
-  }
+  return { pass: true, tamperResult };
+}
 
-  // 🟡 주의 (우선순위 6): AI 위변조 중신뢰 OR 도용 단독 의심 OR AI생성 단독 의심
-  if (tamperResult) {
-    const mediumTamper = tamperResult.tamperLevel === 'medium';
-    const onlyStolen   = tamperResult.isSuspectedStolen && tamperResult.tamperLevel === 'low';
-    const onlyAI       = tamperResult.isSuspectedAI     && tamperResult.tamperLevel === 'low';
-
-    if (mediumTamper || onlyStolen || onlyAI) {
-      const cautionReasons = [];
-      if (mediumTamper) cautionReasons.push(`AI 위변조 의심 (신뢰도: ${tamperResult.score}점/100) — ${tamperResult.reason}`);
-      if (onlyStolen)   cautionReasons.push('화면 캡처 의심 — 직접 촬영한 영수증인지 확인이 필요합니다');
-      if (onlyAI)       cautionReasons.push('AI 생성 이미지 의심 — 생성형 AI로 만든 영수증일 수 있습니다');
-      cautionReasons.push('수동 검토를 권장합니다.');
-      return { status: 'caution', icon: '🟡', title: '주의', reasons: cautionReasons };
-    }
-  }
-
-  // 🟡 주의: API 오류 (Key 없음 등)
-  if (apiResult && !apiResult.success) {
-    reasons.push(`국세청 API 오류: ${apiResult.message || '알 수 없는 오류'}`);
-    return { status: 'caution', icon: '🟡', title: '주의', reasons };
-  }
-
-  // 🟢 통과: 사업자번호 없는 영수증 (현금영수증·간이영수증 등)
-  if (!ocrResult || !ocrResult.text || ocrResult.bizNumbers.length === 0) {
-    return { status: 'pass', icon: '🟢', title: '통과', reasons: ['사업자번호 없는 영수증으로 확인됩니다.'] };
-  }
-
-  // 🟢 정상: 모든 조건 통과
-  const passReasons = [];
-  if (exifResult && !exifResult.error) passReasons.push('EXIF 조작 흔적 없음');
-  if (apiResult?.bizNo) passReasons.push(`사업자번호: ${apiResult.bizNo}`);
-  if (apiResult?.statusText) passReasons.push(`사업자 상태: ${apiResult.statusText}`);
-  if (apiResult?.taxType) passReasons.push(`과세 유형: ${apiResult.taxType}`);
-
+// 4단계: AI 생성 이미지 탐지 (3단계 Gemini 응답 재사용, 추가 API 호출 없음)
+function step4AI(tamperResult) {
+  if (!tamperResult || !tamperResult.isSuspectedAI) return { pass: true };
   return {
-    status: 'pass',
-    icon: '🟢',
-    title: '정상',
-    reasons: passReasons.length > 0 ? passReasons : ['검증 통과']
+    pass: false,
+    verdict: { status: 'reject', icon: '🔴', title: '반려', reasons: ['[4단계] AI 생성 이미지 탐지 — 생성형 AI로 만든 영수증으로 의심됩니다'] }
   };
+}
+
+function buildApprovalReasons(bizNo, cardBIN) {
+  const reasons = [];
+  if (bizNo) reasons.push(`사업자번호: ${bizNo} — 계속사업자 확인`);
+  if (cardBIN) reasons.push(`카드 BIN: ${cardBIN} — 유효한 카드번호`);
+  reasons.push('이미지 위변조 흔적 없음', 'AI 생성 이미지 아님');
+  return reasons;
 }
 
 // ── 8. 메인 검증 흐름 ───────────────────────────────────────
 
 async function verifyReceipt(imgEl, button) {
-  // API Key 확인 (alert 대신 모달 사용 — 어드민 동작을 차단하지 않음)
   const { apiKey } = await chrome.storage.local.get('apiKey');
   if (!apiKey) {
     showModal(null, {
-      status: 'caution',
-      icon: '🟡',
-      title: 'API Key 미설정',
+      status: 'caution', icon: '🟡', title: 'API Key 미설정',
       reasons: ['확장 프로그램 아이콘 우클릭 → "옵션"에서 공공데이터포털 API Key를 먼저 입력해 주세요.']
     });
     return;
@@ -586,93 +695,69 @@ async function verifyReceipt(imgEl, button) {
   showSpinner(button);
 
   try {
-    // content script 컨텍스트에서 이미지 dataURL 취득 (브라우저 쿠키/인증 자동 포함)
     const dataURL = await getImageDataURL(imgEl).catch(e => {
       console.warn('[YRG] 이미지 dataURL 취득 실패:', e.message);
       return null;
     });
-
-    if (!dataURL) {
-      throw new Error('이미지를 불러올 수 없습니다. (CORS 또는 네트워크 오류)');
-    }
+    if (!dataURL) throw new Error('이미지를 불러올 수 없습니다. (CORS 또는 네트워크 오류)');
     console.log('[YRG] 이미지 dataURL 취득 완료, 길이:', dataURL.length);
 
-    // 병렬 실행: EXIF + Hash + OCR (Gemini Vision) + 위변조 분석 + 픽셀 노이즈 분석
-    const [exifResult, hashResult, ocrResult, tamperResult, noiseResult] = await Promise.all([
-      analyzeEXIF(imgEl).catch(() => ({ isTampered: false, error: true })),
-      extractHash(imgEl).catch(() => ({ hash: null, error: true })),
-      runOCR(dataURL).catch(e => {
-        if (e.message === 'NO_GEMINI_KEY') throw e;
-        console.warn('[YRG] OCR 오류:', e.message);
-        return null;
-      }),
-      analyzeTamper(dataURL).catch(() => ({ tamperLevel: 'unknown', error: true })),
-      analyzeImageNoise(dataURL).catch(() => ({ isPaintSuspect: false }))
-    ]);
+    // Gemini 압축 + 로컬 분석 동시 시작
+    const geminiImgPromise = compressImageForGemini(dataURL);
+    const hashPromise   = extractHash(imgEl).catch(() => ({ hash: null, error: true }));
+    const exifPromise   = analyzeEXIF(imgEl).catch(() => ({ isTampered: false, error: true }));
+    const noisePromise  = analyzeImageNoise(dataURL).catch(() => ({ isPaintSuspect: false }));
 
-    // 캔버스 분석이 그림판 편집 의심 → Gemini가 low/unknown이어도 medium으로 격상
-    if (noiseResult.isPaintSuspect) {
-      const paintReason = `픽셀 분석: 편집 도구로 지워진 영역 의심 (이상 블록 ${noiseResult.suspiciousBlocks}개, ${noiseResult.ratio}%)`;
-      console.log('[YRG]', paintReason);
-      if (!tamperResult.tamperLevel || tamperResult.tamperLevel === 'low' || tamperResult.tamperLevel === 'unknown') {
-        tamperResult.tamperLevel = 'medium';
-        tamperResult.reason = tamperResult.reason && tamperResult.reason !== '이상 없음'
-          ? `${tamperResult.reason} / ${paintReason}`
-          : paintReason;
-      }
+    // 압축 완료(~20ms) 후 Gemini 호출 시작 — 노이즈 분석은 원본 유지
+    const geminiImg = await geminiImgPromise;
+    const ocrPromise    = runOCR(geminiImg).catch(e => { if (e.message === 'NO_GEMINI_KEY') throw e; console.warn('[YRG] OCR 오류:', e.message); return null; });
+    const tamperPromise = analyzeTamper(geminiImg).catch(() => ({ tamperLevel: 'unknown', error: true }));
+
+    // OCR 완료 후 비영수증 조기 반려 체크
+    const ocrRaw = await ocrPromise;
+    if (ocrRaw?.isReceipt === false) {
+      showModal(imgEl, {
+        status: 'reject', icon: '🔴', title: '반려',
+        reasons: ['[0단계] 영수증 이미지가 아닙니다 — 카드 영수증 이미지를 업로드해 주세요.']
+      });
+      return;
     }
 
-    const bizNumbers = extractBusinessNumber(ocrResult?.text);
-    const approvalNo = ocrResult?.approvalNo || null;
-    const cardBIN    = ocrResult?.cardBIN    || null;
+    // 1·2단계 병렬 실행
+    const bizNumbers = extractBusinessNumber(ocrRaw?.text);
+    const bizNo      = bizNumbers[0] || null;
+    const cardBIN    = ocrRaw?.cardBIN    || null;
+    const approvalNo = ocrRaw?.approvalNo || null;
 
-    // 중복 검사 (hash 또는 승인번호 중 하나라도 있으면 실행)
-    let duplicateResult = { isDuplicate: false };
-    if (hashResult.hash || approvalNo) {
-      duplicateResult = await compareHash(hashResult.hash, approvalNo).catch(() => ({ isDuplicate: false }));
-      if (duplicateResult.isDuplicate) {
-        console.log('[YRG] 중복 감지:', duplicateResult.reason === 'approvalNo' ? `승인번호 일치` : `해시 유사도 (distance: ${duplicateResult.distance})`);
-      }
-    }
+    const [r1, r2] = await Promise.all([step1BizNo(bizNo), step2CardBIN(cardBIN)]);
+    if (!r1.pass) { showModal(imgEl, r1.verdict); return; }
+    if (!r2.pass) { showModal(imgEl, r2.verdict); return; }
 
-    // 국세청 API 검증 + 카드 BIN 검증 병렬 실행 (중복이 아닐 때만)
-    let apiResult = null;
-    let binResult = null;
-    if (!duplicateResult.isDuplicate) {
-      [apiResult, binResult] = await Promise.all([
-        bizNumbers.length > 0
-          ? verifyBusinessNumber(bizNumbers[0]).catch(err => ({ success: false, error: 'API_ERROR', message: err.message }))
-          : Promise.resolve(null),
-        cardBIN
-          ? checkCardBIN(cardBIN).catch(() => ({ valid: true, skip: true }))
-          : Promise.resolve(null)
-      ]);
-      if (binResult && binResult.valid === false) {
-        console.log('[YRG] 카드 BIN 무효:', cardBIN);
-      }
-    }
+    // ── 3단계: 이미지 위변조 탐지 (사전 시작된 프로미스 재사용) ───────
+    const hashResult = await hashPromise;
+    const hashInfo = { hash: hashResult.hash, approvalNo };
+    const r3 = await step3Tamper(imgEl, dataURL, hashInfo, { exif: exifPromise, noise: noisePromise, tamper: tamperPromise });
+    if (!r3.pass) { showModal(imgEl, r3.verdict); return; }
 
-    const verdict = judgeResult(exifResult, { text: ocrResult?.text, bizNumbers }, apiResult, duplicateResult, tamperResult, binResult);
-    const confirmData = (verdict.status === 'pass' && (hashResult.hash || approvalNo))
-      ? { hash: hashResult.hash, approvalNo }
-      : null;
-    showModal(imgEl, verdict, confirmData);
+    // ── 4단계: AI 생성 이미지 탐지 ──────────────────────────────────
+    const r4 = step4AI(r3.tamperResult);
+    if (!r4.pass) { showModal(imgEl, r4.verdict); return; }
+
+    // ── 최종 승인 ────────────────────────────────────────────────────
+    const confirmData = (hashResult.hash || approvalNo) ? { hash: hashResult.hash, approvalNo } : null;
+    showModal(imgEl, {
+      status: 'pass', icon: '🟢', title: '최종 승인',
+      reasons: buildApprovalReasons(bizNo, cardBIN)
+    }, confirmData);
 
   } catch (err) {
     if (err.message === 'NO_GEMINI_KEY') {
       showModal(imgEl, {
-        status: 'caution',
-        icon: '🟡',
-        title: 'Gemini API Key 미설정',
+        status: 'caution', icon: '🟡', title: 'Gemini API Key 미설정',
         reasons: ['확장 프로그램 아이콘 우클릭 → "옵션"에서 Gemini API Key를 먼저 입력해 주세요. (OCR에 필수)']
       });
     } else {
-      showModal(imgEl, {
-        status: 'error',
-        icon: '⚪',
-        title: '오류',
-        reasons: [err.message]
-      });
+      showModal(imgEl, { status: 'error', icon: '⚪', title: '오류', reasons: [err.message] });
     }
   } finally {
     hideSpinner(button);
