@@ -210,6 +210,29 @@
       </p>
     </div>
 
+    <hr class="divider">
+
+    <div class="section">
+      <label for="supabaseUrl">Supabase URL <span style="font-weight:normal;color:#888;">(중복 영수증 클라우드 저장)</span></label>
+      <input type="text" id="supabaseUrl" placeholder="https://xxxxxxxxxxxxxxxx.supabase.co" autocomplete="off">
+      <p class="help-text">
+        Supabase 프로젝트 Settings → API → Project URL을 복사해 입력하세요.<br>
+        미입력 시 중복 해시를 이 브라우저 로컬에만 저장합니다.
+      </p>
+    </div>
+
+    <div class="section">
+      <label for="supabaseAnonKey">Supabase Anon Key</label>
+      <input type="password" id="supabaseAnonKey" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." autocomplete="off">
+      <div class="toggle-visibility">
+        <input type="checkbox" id="showSupabaseKey">
+        <label for="showSupabaseKey">Anon Key 표시</label>
+      </div>
+      <p class="help-text">
+        Supabase 프로젝트 Settings → API → <strong>anon public</strong> 키를 입력하세요.
+      </p>
+    </div>
+
     <button class="btn-save" id="saveBtn">저장</button>
     <div id="statusMsg"></div>
 

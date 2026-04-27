@@ -45,7 +45,8 @@
     {
       "resources": [
         "lib/exif.js",
-        "lib/blockhash.js"
+        "lib/blockhash.js",
+        "lib/medical-keywords.json"
       ],
       "matches": ["https://admin.fastlane.kr/*"]
     }

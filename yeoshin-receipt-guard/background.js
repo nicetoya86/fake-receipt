@@ -58,18 +58,38 @@ function findVisualFix(digits, similarMap) {
 // Gemini 응답에서 사업자번호 패턴만 추출 (레이블·설명 제거)
 function extractBizNoText(raw) {
   if (!raw) return '없음';
-  const match = raw.match(/\d{3}-\d{2}-\d{5}/);
-  if (match) return match[0];
-  if (raw.includes('없음')) return '없음';
-  return raw.trim();
+
+  // '사업자번호:' 레이블 다음 값 우선 추출
+  const labelMatch = raw.match(/사업자번호:\s*([^\n]+)/);
+  const candidate = labelMatch ? labelMatch[1].trim() : '';
+
+  // candidate에서 NNN-NN-NNNNN 매칭
+  if (candidate) {
+    const m = candidate.match(/(?<!\d)\d{3}-\d{2}-\d{5}(?!\d)/);
+    if (m) return m[0];
+    if (candidate.includes('없음')) return '없음';
+  }
+
+  // 전체 raw에서 NNN-NN-NNNNN 재탐색
+  const fullMatch = raw.match(/(?<!\d)\d{3}-\d{2}-\d{5}(?!\d)/);
+  if (fullMatch) return fullMatch[0];
+
+  // 유효한 번호 없으면 없음 반환 (전체 텍스트 반환 금지)
+  return '없음';
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// ── 중복 해시 관리 ────────────────────────────────────────────────────────────
+// ── 중복 해시 관리 (Supabase 기반, chrome.storage.local 폴백) ────────────────
 
 const HASH_TTL_MS = 365 * 24 * 60 * 60 * 1000; // 1년
 const HAMMING_THRESHOLD = 10;
+
+// UTC ms → KST ISO 문자열 (예: "2026-04-27T16:30:00.000+09:00")
+function toKSTISOString(ms) {
+  const d = new Date(ms + 9 * 60 * 60 * 1000);
+  return d.toISOString().replace('Z', '+09:00');
+}
 
 function hammingDistance(hash1, hash2) {
   if (!hash1 || !hash2 || hash1.length !== hash2.length) return Infinity;
@@ -81,11 +101,63 @@ function hammingDistance(hash1, hash2) {
   return dist;
 }
 
-async function manageReceiptHashes(newHash, approvalNo) {
+// Supabase REST API 호출 헬퍼
+async function supabaseFetch(method, path, body, supabaseUrl, anonKey) {
+  const headers = {
+    'apikey': anonKey,
+    'Authorization': `Bearer ${anonKey}`,
+    'Content-Type': 'application/json'
+  };
+  if (method === 'POST') headers['Prefer'] = 'return=representation';
+
+  const res = await fetch(`${supabaseUrl}/rest/v1/${path}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => res.status);
+    throw new Error(`Supabase ${method} ${path} → ${res.status}: ${errText}`);
+  }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+// Supabase 기반 해시 관리
+async function manageReceiptHashesSupabase(newHash, approvalNo, reviewUrl, supabaseUrl, anonKey) {
+  const now = Date.now();
+  const ttlDate = new Date(now - HASH_TTL_MS).toISOString();
+
+  // approved 항목만 조회 (TTL 필터 포함)
+  const rows = await supabaseFetch(
+    'GET',
+    `receipt_hashes?select=id,hash,approval_no,saved_at,review_url&status=eq.approved&saved_at=gte.${ttlDate}`,
+    null, supabaseUrl, anonKey
+  );
+
+  if (!newHash && !approvalNo) return { isDuplicate: false };
+
+  // 중복 비교
+  for (const row of (rows || [])) {
+    if (approvalNo && row.approval_no && approvalNo === row.approval_no) {
+      return { isDuplicate: true, savedAt: new Date(row.saved_at).getTime(), reason: 'approvalNo', reviewUrl: row.review_url || null };
+    }
+    if (newHash && row.hash) {
+      const dist = hammingDistance(newHash, row.hash);
+      if (dist <= HAMMING_THRESHOLD) {
+        return { isDuplicate: true, savedAt: new Date(row.saved_at).getTime(), reason: 'hash', distance: dist, reviewUrl: row.review_url || null };
+      }
+    }
+  }
+
+  // 중복 아님 — 승인 시에만 저장하므로 여기서는 INSERT 안 함
+  return { isDuplicate: false };
+}
+
+// chrome.storage.local 폴백 해시 관리 (Supabase 미설정 또는 오류 시)
+async function manageReceiptHashesLocal(newHash, approvalNo, reviewUrl) {
   const { receiptHashes = [] } = await chrome.storage.local.get('receiptHashes');
   const now = Date.now();
-
-  // TTL 정리: 1년 초과 항목 제거
   const validHashes = receiptHashes.filter(entry => (now - entry.savedAt) < HASH_TTL_MS);
 
   if (!newHash && !approvalNo) {
@@ -93,47 +165,63 @@ async function manageReceiptHashes(newHash, approvalNo) {
     return { isDuplicate: false };
   }
 
-  // 승인된 항목만 중복 비교 (status 없는 레거시 항목도 approved 취급)
   for (const entry of validHashes) {
     if (entry.status === 'pending') continue;
     if (approvalNo && entry.approvalNo && approvalNo === entry.approvalNo) {
       await chrome.storage.local.set({ receiptHashes: validHashes });
-      return { isDuplicate: true, savedAt: entry.savedAt, reason: 'approvalNo' };
+      return { isDuplicate: true, savedAt: entry.savedAt, reason: 'approvalNo', reviewUrl: entry.reviewUrl || null };
     }
     if (newHash && entry.hash) {
       const dist = hammingDistance(newHash, entry.hash);
       if (dist <= HAMMING_THRESHOLD) {
         await chrome.storage.local.set({ receiptHashes: validHashes });
-        return { isDuplicate: true, savedAt: entry.savedAt, reason: 'hash', distance: dist };
+        return { isDuplicate: true, savedAt: entry.savedAt, reason: 'hash', distance: dist, reviewUrl: entry.reviewUrl || null };
       }
     }
   }
 
-  // 중복 아님 — pending 상태로 저장 (후기 승인 후 approved로 변경 필요)
-  validHashes.push({ hash: newHash || null, approvalNo: approvalNo || null, savedAt: now, status: 'pending' });
-  await chrome.storage.local.set({ receiptHashes: validHashes });
+  // 중복 아님 — 승인 시에만 저장하므로 여기서는 저장 안 함
   return { isDuplicate: false };
 }
 
-async function confirmReceiptHash(hash, approvalNo) {
-  const { receiptHashes = [] } = await chrome.storage.local.get('receiptHashes');
+async function manageReceiptHashes(newHash, approvalNo, reviewUrl) {
+  const { supabaseUrl, supabaseAnonKey } = await chrome.storage.local.get(['supabaseUrl', 'supabaseAnonKey']);
 
-  // 가장 최근 pending 항목 중 매칭되는 것 하나를 approved로 변경
-  let updated = false;
-  for (let i = receiptHashes.length - 1; i >= 0; i--) {
-    const entry = receiptHashes[i];
-    if (entry.status !== 'pending') continue;
-    const hashMatch = hash && entry.hash && hammingDistance(hash, entry.hash) <= HAMMING_THRESHOLD;
-    const approvalMatch = approvalNo && entry.approvalNo && approvalNo === entry.approvalNo;
-    if (hashMatch || approvalMatch) {
-      receiptHashes[i] = { ...entry, status: 'approved' };
-      updated = true;
-      break;
+  if (supabaseUrl && supabaseAnonKey) {
+    try {
+      return await manageReceiptHashesSupabase(newHash, approvalNo, reviewUrl, supabaseUrl, supabaseAnonKey);
+    } catch (err) {
+      console.warn('[YRG] Supabase 해시 관리 실패, 로컬 폴백:', err.message);
     }
   }
 
-  if (updated) await chrome.storage.local.set({ receiptHashes });
-  return { success: updated };
+  return manageReceiptHashesLocal(newHash, approvalNo, reviewUrl);
+}
+
+async function confirmReceiptHash(hash, approvalNo, reviewUrl) {
+  const now = Date.now();
+  const { supabaseUrl, supabaseAnonKey } = await chrome.storage.local.get(['supabaseUrl', 'supabaseAnonKey']);
+
+  if (supabaseUrl && supabaseAnonKey) {
+    try {
+      await supabaseFetch('POST', 'receipt_hashes', {
+        hash: hash || null,
+        approval_no: approvalNo || null,
+        saved_at: toKSTISOString(now),
+        status: 'approved',
+        review_url: reviewUrl || null
+      }, supabaseUrl, supabaseAnonKey);
+      return { success: true };
+    } catch (err) {
+      console.warn('[YRG] Supabase 승인 저장 실패, 로컬 폴백:', err.message);
+    }
+  }
+
+  // 로컬 폴백
+  const { receiptHashes = [] } = await chrome.storage.local.get('receiptHashes');
+  receiptHashes.push({ hash: hash || null, approvalNo: approvalNo || null, reviewUrl: reviewUrl || null, savedAt: now, status: 'approved' });
+  await chrome.storage.local.set({ receiptHashes });
+  return { success: true };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -149,14 +237,14 @@ const STATUS_MAP = {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'MANAGE_HASHES') {
-    manageReceiptHashes(message.hash, message.approvalNo)
+    manageReceiptHashes(message.hash, message.approvalNo, message.reviewUrl)
       .then(sendResponse)
       .catch(err => sendResponse({ isDuplicate: false, error: err.message }));
     return true;
   }
 
   if (message.type === 'CONFIRM_HASH') {
-    confirmReceiptHash(message.hash, message.approvalNo)
+    confirmReceiptHash(message.hash, message.approvalNo, message.reviewUrl)
       .then(sendResponse)
       .catch(err => sendResponse({ success: false, error: err.message }));
     return true;
@@ -238,36 +326,59 @@ const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 const GEMINI_TIMEOUT_MS = 30000;
 
-const STANDARD_PROMPT = `한국 카드 영수증 이미지에서 다음 네 가지를 확인해주세요.
+const STANDARD_PROMPT = `[중요] 이미지가 90°/180°/270° 회전된 상태일 수 있습니다. 텍스트 방향과 무관하게 각 항목의 레이블을 먼저 정확히 찾은 뒤, 그 레이블 바로 옆·아래에 붙어있는 값만 추출하세요. 레이블 없이 추측하지 마세요.
+
+한국 카드 영수증 이미지에서 다음 여섯 가지를 확인해주세요.
 
 0. 이미지가 영수증인지 판단
    - 영수증(POS 영수증, 신용·체크카드 전표, 세금계산서, 배달 영수증)이면 "예"
    - 광고물·사진·스크린샷·문서·명함 등 영수증이 아니면 "아니오"
    - 영수증이 찍힌 사진이나 부분적으로 보이는 영수증도 "예"
 
-1. 가맹점(판매자)의 사업자등록번호 (10자리, "XXX-XX-XXXXX" 형식)
-   - "사업자번호", "사업자등록번호", "Biz No", "가맹점번호", "사업자" 레이블 옆에 있으면 우선 사용
-   - 레이블이 없더라도 XXX-XX-XXXXX 형식(3자리-2자리-5자리)의 숫자가 보이면 사업자등록번호로 추출하세요
+1. 가맹점(판매자)의 상호명
+   - "가맹점명", "상호", "판매처", "가맹점", "사업장명" 레이블 옆 또는 영수증 상단에 표기된 업체명
+   - 지점명(예: "강남점", "홍대점")이 붙어있으면 포함해서 추출하세요
+   - 카드사명(삼성카드, 신한카드 등)과 혼동하지 마세요
+
+2. 상호명이 병·의원·한의원·치과·약국 등 의료기관인지 판단
+   - 의료기관이면 "예", 음식점·카페·쇼핑 등 비의료기관이면 "아니오", 판단 불가이면 "불명"
+
+3. 가맹점(판매자)의 사업자등록번호 (10자리, "XXX-XX-XXXXX" 형식)
+   - 반드시 정확히 "NNN-NN-NNNNN" (3자리-2자리-5자리, 총 10자리) 형식으로 표기된 숫자만 추출하세요
+   - [우선순위 1] "사업자번호", "사업자등록번호", "Biz No", "사업자" 레이블 옆 숫자를 먼저 확인하세요
+   - [우선순위 2] 레이블이 없더라도 영수증 전체 텍스트에서 NNN-NN-NNNNN 형식(3자리-대시-2자리-대시-5자리)의 숫자를 빠짐없이 스캔하여 추출하세요
+   - Cashnote Pay 등 일부 영수증은 가맹점명 오른쪽에 레이블 없이 사업자번호만 표기합니다 (예: "나인피부과 강남점   565-10-01602"). 이 경우도 반드시 추출하세요
+   - 슬래시(/) 구분 형식 (예: "0141334656/546-33-01634"): 반드시 슬래시 오른쪽의 대시(-)가 포함된 숫자(예: "546-33-01634")만 사업자번호로 추출하세요
+   - [절대 금지] 슬래시 왼쪽의 대시 없는 숫자(예: 0141334656, 203742503)에 임의로 대시를 삽입하지 마세요. 이 숫자를 NNN-NN-NNNNN 형식으로 변환하는 것은 금지입니다
+   - 대시(-) 없이 붙어있는 숫자(예: 203742503, 611023899862)는 가맹점 ID·고유번호이므로 무시하세요
+   - "고유번호", "일련번호" 레이블 옆 숫자는 사업자등록번호가 아닙니다 — 절대 추출하지 마세요
+   - 사업자번호는 반드시 정확히 NNN-NN-NNNNN (3자리-2자리-5자리) 형식이어야 하며, 슬래시 왼쪽 숫자의 일부를 앞자리로 사용하지 마세요
    - 전화번호(02-, 010/011/016/017/018/019로 시작)와 혼동하지 마세요
    - 카드사(한국신용카드결제, KOCES 등)가 아닌 가맹점 번호를 찾으세요
-   - 이미지가 기울어지거나 배경이 있어도 정확히 읽으세요
+   - 영수증 전체를 꼼꼼히 읽어 NNN-NN-NNNNN 패턴이 하나라도 있으면 반드시 추출하고, 진짜로 없을 때만 "없음"으로 답하세요
 
-2. 카드 승인번호 (숫자 6~10자리)
-   - "승인번호", "승인 번호", "승인No", "Approval No" 레이블 옆에 있음
+4. 카드 승인번호 (숫자 6~10자리)
+   - 반드시 "승인번호", "승인 번호", "승인No", "Approval No" 레이블 바로 옆에 있는 숫자만 추출하세요
    - 카드사명이 괄호로 붙어있을 수 있음 (예: 승인번호(삼성카드))
    - 숫자만 추출하세요 (공백·[CC] 등 기호 제거)
+   - [절대 금지] 카드번호(XXXX-XXXX-****-**** 형식)의 일부를 승인번호로 추출하지 마세요. 카드번호 앞 8자리(예: 9410-6186)를 승인번호로 오인하지 마세요
 
-3. 카드번호 앞 6자리 (BIN)
+5. 카드번호 앞 자리 (BIN)
    - "카드번호", "Card No", "승인카드번호" 레이블 옆에 있음
-   - 형식: XXXX-XX**-****-XXXX 또는 XXXX XXXX XXXX XXXX (뒷자리 마스킹 포함)
-   - 앞 6자리만 추출 (예: "423456")
+   - 영수증마다 보이는 자릿수가 다릅니다. 자릿수별 처리 규칙:
+     * 앞 4자리만 표시된 경우 (예: XXXX-****-****-****): 그 4자리를 추출하세요 (예: "4234")
+     * 앞 6자리 표시된 경우 (예: XXXX-XX**-****-****): 그 6자리를 추출하세요 (예: "423456")
+     * 앞 8자리 표시된 경우 (예: XXXX-XXXX-****-****): 앞 6자리만 추출하세요 (예: "423456")
+   - 마스킹(*) 처리된 자리는 무시하고, 숫자로 표시된 앞 자리만 추출하세요
    - 카드번호 자체가 없으면 "없음" 기재
 
-답변은 반드시 아래 형식 네 줄로만:
+답변은 반드시 아래 형식 여섯 줄로만:
 영수증여부: 예|아니오
+상호명: [업체명]
+의료기관여부: 예|아니오|불명
 사업자번호: XXX-XX-XXXXX
 승인번호: XXXXXXXX
-카드BIN: XXXXXX
+카드BIN: XXXX 또는 XXXXXX
 (없으면 해당 항목에 "없음" 기재)`;
 
 // 1차와 다른 프롬프트로 재시도 — 힌트 없이 신중하게 읽기만 요청
@@ -294,6 +405,20 @@ const TAMPER_PROMPT = `한국 카드 영수증 이미지의 위변조 여부를 
    - 폰트 이질성: POS 열인쇄 폰트(비트맵 계열, 가장자리 회색조 계단)와 Windows/컴퓨터 입력 폰트(안티앨리어싱, 매끈한 곡선)가 동일 필드 또는 인접 필드에 혼재하는지 확인
    - 배경 이질성: 거래일시·금액 등 핵심 필드 주변 배경이 나머지 영수증 배경보다 더 희고 균일하면(종이 질감·노이즈 없음) 흰색 덮어쓰기 편집으로 판단
    - 날짜 값이 오늘 날짜와 일치하더라도, 배경 이질성·폰트 불일치 등 시각적 편집 흔적이 있으면 "거래핵심정보" 편집으로 판단
+   - [열전사 프린터 정상 범위 — 아래 미세한 차이는 편집 흔적으로 보지 않음]
+     * 날짜 연도(예: "26/04/21"의 "26")가 월·일보다 배경이 "약간" 밝거나 폰트 굵기가 "미세하게" 달라 보이는 것 (종이 질감·노이즈는 유지되어 있음)
+     * 날짜 구분자(/, -)를 기준으로 앞뒤 숫자의 선명도나 폰트 두께가 미세하게 다른 것
+     * 비스듬한 촬영·조명 반사로 특정 영역이 약간 밝아 보이는 것 (영수증 전체에 걸쳐 자연스러운 광량 그라데이션이 있음)
+   - [단일 증거만으로도 즉시 위변조(교체)로 판정해야 하는 명백한 편집 흔적]
+     * 순백색 직사각형 위에 새로운 텍스트·숫자가 덧씌워진 경우 — 흰색 덮어쓰기 후 교체의 확정적 증거
+     * 열인쇄 비트맵 폰트(가장자리 회색 계단, 도트 패턴)와 컴퓨터 폰트(안티앨리어싱, 매끄러운 곡선)가 동일 필드에 혼재하는 경우
+     * 특정 핵심 필드(날짜·금액·가맹점명)의 배경만 종이 질감이 완전히 사라지고 균일한 흰색이며 그 위에 새 텍스트가 있는 경우
+     * 위 세 가지 중 하나라도 해당하면 단독으로 편집유형 "교체"로 판정하세요
+   - [은닉 독립 평가 원칙 — 중요]
+     * 카드번호·소지자명 등 개인정보를 검정색·흰색·스티커 등으로 단순히 가린 경우(가린 영역 위에 새 텍스트 없음)는 "카드정보 은닉"으로만 판정하세요
+     * 은닉이 있더라도 날짜·금액·가맹점명 등 나머지 필드는 독립적으로 평가하세요 — 카드번호 가림이 있다는 이유로 날짜 등 다른 필드를 의심하지 마세요
+     * 순백색·검정 직사각형이 있어도 그 위에 새 텍스트가 없으면 "교체"가 아닌 "은닉"으로 판정하세요
+   - 그 외 미세한 차이가 2가지 이상 동시에 관찰될 때 위변조로 판정하세요
 2. 수치 논리 일관성: 소계+부가세=합계 여부 (반드시 계산으로 확인), 미래 날짜·비정상 시간대
 3. 영수증 구조: 가맹점명·날짜·금액 등 필수 항목 누락, 전체 레이아웃 자연스러움
 4. 화면 캡처/스크린샷 여부:
@@ -376,6 +501,22 @@ async function analyzeVisualTamper(dataURL) {
 
 // ──────────────────────────────────────────────────────────────────────────────
 
+// Gemini 응답에서 상호명 추출
+function extractMerchantNameText(raw) {
+  if (!raw) return null;
+  const match = raw.match(/상호명:\s*(.+)/);
+  if (!match) return null;
+  const name = match[1].trim();
+  return (name === '없음' || name === '') ? null : name;
+}
+
+// Gemini 응답에서 의료기관여부 추출 ('예'|'아니오'|'불명')
+function extractMedicalFlagText(raw) {
+  if (!raw) return '불명';
+  const match = raw.match(/의료기관여부:\s*(예|아니오|불명)/);
+  return match ? match[1] : '불명';
+}
+
 // Gemini 응답에서 승인번호 추출
 function extractApprovalNoText(raw) {
   if (!raw) return null;
@@ -383,11 +524,16 @@ function extractApprovalNoText(raw) {
   return match ? match[1] : null;
 }
 
-// Gemini 응답에서 카드 BIN(앞 6자리) 추출
+// Gemini 응답에서 카드 BIN 추출
+// 영수증 노출 자릿수: 앞 4자리 → 4자리 그대로, 앞 6자리 → 6자리 그대로, 앞 8자리 → 앞 6자리
 function extractCardBINText(raw) {
   if (!raw) return null;
-  const match = raw.match(/카드BIN:\s*(\d{6})/);
-  return match ? match[1] : null;
+  const match = raw.match(/카드BIN:\s*(\d{4,8})/);
+  if (!match) return null;
+  const digits = match[1];
+  if (digits.length >= 6) return digits.slice(0, 6); // 6~8자리 → 앞 6자리
+  if (digits.length === 4) return digits;              // 앞 4자리 → 그대로 (브랜드 식별용)
+  return null;                                         // 5자리 이하 (비정상) → 스킵
 }
 
 async function geminiOCRFromDataURL(dataURL) {
@@ -409,6 +555,9 @@ async function geminiOCRFromDataURL(dataURL) {
   let text = extractBizNoText(rawText);
   let approvalNo = extractApprovalNoText(rawText);
   let cardBIN = extractCardBINText(rawText);
+  let merchantName = extractMerchantNameText(rawText);
+  let medicalFlag = extractMedicalFlagText(rawText);
+  console.log('[YRG BG] 상호명 추출:', merchantName || '없음', '/ 의료기관여부:', medicalFlag);
 
   // "없음" 처리: 같은 프롬프트로 1차 재시도 (비결정적 특성 활용, 2/3 확률 성공)
   if (text === '없음') {
@@ -417,6 +566,8 @@ async function geminiOCRFromDataURL(dataURL) {
     text = extractBizNoText(rawText);
     if (!approvalNo) approvalNo = extractApprovalNoText(rawText);
     if (!cardBIN) cardBIN = extractCardBINText(rawText);
+    if (!merchantName) merchantName = extractMerchantNameText(rawText);
+    if (medicalFlag === '불명') medicalFlag = extractMedicalFlagText(rawText);
   }
   // 여전히 "없음"이면 다른 프롬프트로 2차 재시도
   if (text === '없음') {
@@ -437,7 +588,7 @@ async function geminiOCRFromDataURL(dataURL) {
     if (fixes.length === 1) {
       const corrected = formatBizNo(fixes[0]);
       console.log('[YRG BG] 1↔4 자동수정:', text, '→', corrected);
-      return { success: true, text: corrected, approvalNo };
+      return { success: true, text: corrected, approvalNo, cardBIN, merchantName, medicalFlag };
     }
 
     // 2단계: 확장 혼동 집합 시도
@@ -445,7 +596,7 @@ async function geminiOCRFromDataURL(dataURL) {
     if (fixes.length === 1) {
       const corrected = formatBizNo(fixes[0]);
       console.log('[YRG BG] 시각 유사 자동수정:', text, '→', corrected);
-      return { success: true, text: corrected, approvalNo };
+      return { success: true, text: corrected, approvalNo, cardBIN, merchantName, medicalFlag };
     }
 
     // 3단계: 후보 다수 → 우선순위 기반 선택 (NTS 추가 호출 없이)
@@ -460,10 +611,10 @@ async function geminiOCRFromDataURL(dataURL) {
     const best = preferred ?? fixes[0];
     const corrected = formatBizNo(best);
     console.log('[YRG BG] 우선순위 선택:', corrected, preferred ? '(4→1)' : '(첫번째 후보)');
-    return { success: true, text: corrected, approvalNo };
+    return { success: true, text: corrected, approvalNo, cardBIN, merchantName, medicalFlag };
   }
 
-  return { success: true, text, approvalNo, cardBIN };
+  return { success: true, text, approvalNo, cardBIN, merchantName, medicalFlag };
 }
 
 // 단일 Gemini API 호출 (타임아웃 독립 관리)
@@ -482,7 +633,7 @@ async function callGeminiOCR(apiKey, base64, mimeType, promptText, maxOutputToke
             { text: promptText }
           ]
         }],
-        generationConfig: { temperature: 0, maxOutputTokens }
+        generationConfig: { temperature: 0, maxOutputTokens, thinkingConfig: { thinkingBudget: 0 } }
       }),
       signal: controller.signal
     });
@@ -510,7 +661,7 @@ async function callGeminiOCR(apiKey, base64, mimeType, promptText, maxOutputToke
 
 // ── 카드 BIN 유효성 검증 ──────────────────────────────────────────────────────
 
-const BIN_API_URL = 'https://lookup.binlist.net';
+const BIN_API_URL = 'https://data.handyapi.com/bin';
 const BIN_TIMEOUT_MS = 8000;
 
 // 로컬 BIN 데이터 메모리 캐시 (서비스워커 재시작 시 재로드)
@@ -528,9 +679,50 @@ async function loadBinData() {
   }
 }
 
+// 주요 카드사 BIN 범위로 카드 종류 판별 (로컬 DB 미등록 BIN 사전 필터, 6자리용)
+function detectCardScheme(bin) {
+  const n = parseInt(bin, 10);
+  if (bin[0] === '4') return 'Visa';
+  if ((n >= 510000 && n <= 559999) || (n >= 222100 && n <= 272099)) return 'Mastercard';
+  if (bin.startsWith('34') || bin.startsWith('37')) return 'Amex';
+  if (bin.startsWith('6011') || bin.startsWith('65') ||
+      (n >= 644000 && n <= 649999) || (n >= 622126 && n <= 622925)) return 'Discover';
+  if (bin.startsWith('35')) return 'JCB';
+  if (bin.startsWith('36') || bin.startsWith('300') || bin.startsWith('301') ||
+      bin.startsWith('302') || bin.startsWith('303') || bin.startsWith('304') ||
+      bin.startsWith('305') || bin.startsWith('38')) return 'Diners';
+  if (bin.startsWith('62')) return 'UnionPay';
+  return null;
+}
+
+// 앞 4자리만 표시된 영수증용 브랜드 식별 (6자리 BIN 조회 불가 → 브랜드 범위만 확인)
+function detectCardSchemeFrom4(bin4) {
+  const n = parseInt(bin4, 10);
+  if (bin4[0] === '4') return 'Visa';
+  if ((n >= 5100 && n <= 5599) || (n >= 2221 && n <= 2720)) return 'Mastercard';
+  if (bin4.startsWith('34') || bin4.startsWith('37')) return 'Amex';
+  if (bin4.startsWith('60') || bin4.startsWith('64') || bin4.startsWith('65')) return 'Discover';
+  if (bin4.startsWith('35')) return 'JCB';
+  if (bin4.startsWith('36') || bin4.startsWith('38') || (n >= 3000 && n <= 3059)) return 'Diners';
+  if (bin4.startsWith('62')) return 'UnionPay';
+  return null;
+}
+
 async function verifyCardBIN(bin) {
-  if (!bin || !/^\d{6}$/.test(bin)) {
+  if (!bin || !/^\d{4,6}$/.test(bin)) {
+    console.log('[YRG BG] BIN 검증 스킵 — 형식 오류:', bin);
     return { valid: true, skip: true, reason: 'BIN 형식 오류' };
+  }
+
+  // 앞 4자리만 표시된 경우 → 브랜드 식별만 수행 (6자리 BIN 조회 불가)
+  if (bin.length === 4) {
+    const scheme = detectCardSchemeFrom4(bin);
+    if (!scheme) {
+      console.warn('[YRG BG] BIN 4자리 — 알 수 없는 카드사 범위:', bin);
+      return { valid: false, bin, reason: `알 수 없는 카드번호 — 앞 4자리(${bin})가 주요 카드사 범위에 해당하지 않습니다` };
+    }
+    console.log('[YRG BG] BIN 4자리 브랜드 식별 통과:', bin, scheme);
+    return { valid: true, bin, scheme, source: 'scheme-4digit' };
   }
 
   // 로컬 BIN 데이터 우선 조회 (API 호출 없이 즉시 처리)
@@ -539,44 +731,73 @@ async function verifyCardBIN(bin) {
 
     if (_binKorea[bin]) {
       const d = _binKorea[bin];
+      console.log('[YRG BG] BIN 검증 통과 — 국내 DB 매칭:', bin, d.i);
       return { valid: true, bin, issuer: d.i, type: d.t, source: 'local-korea' };
     }
 
     const binNum = parseInt(bin, 10);
     const intlMatch = _binIntl.find(r => binNum >= parseInt(r.s, 10) && binNum <= parseInt(r.e, 10));
     if (intlMatch) {
+      console.log('[YRG BG] BIN 검증 통과 — 국제 DB 매칭:', bin, intlMatch.b);
       return { valid: true, bin, issuer: intlMatch.b, scheme: intlMatch.sc, source: 'local-intl' };
     }
   } catch (loadErr) {
     console.warn('[YRG BG] 로컬 BIN 데이터 로드 실패, API로 fallback:', loadErr.message);
   }
 
-  // Fallback: binlist.net API
+  // 로컬 DB 미등록 — 주요 카드사 범위 사전 검사
+  const scheme = detectCardScheme(bin);
+  if (!scheme) {
+    console.warn('[YRG BG] BIN 알 수 없는 카드사 범위:', bin, '— 주요 카드사(Visa/MC/Amex/JCB 등) BIN 아님');
+    return { valid: false, bin, reason: `알 수 없는 카드번호 — BIN ${bin}은(는) 주요 카드사 범위에 해당하지 않습니다` };
+  }
+
+  console.log('[YRG BG] BIN 로컬 미등록, API 조회 시작:', bin, `(${scheme} 범위)`);
+
+  // Fallback: handyapi.me BIN API (월 80,000회 무료, API Key 불필요)
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), BIN_TIMEOUT_MS);
 
   try {
     const response = await fetch(`${BIN_API_URL}/${bin}`, {
-      headers: { 'Accept-Version': '3' },
       signal: controller.signal
     });
     clearTimeout(timeoutId);
 
-    if (response.status === 404) {
-      return { valid: false, bin, reason: '유효하지 않은 카드번호 (BIN 미등록)' };
-    }
-    if (response.status === 429) {
-      return { valid: true, skip: true, reason: 'Rate Limit 초과' };
-    }
     if (!response.ok) {
+      console.warn('[YRG BG] BIN API 오류 — 검증 스킵:', bin, response.status);
       return { valid: true, skip: true, reason: `BIN API 오류 (HTTP ${response.status})` };
     }
 
     const data = await response.json();
-    return { valid: true, bin, scheme: data.scheme, country: data.country?.alpha2, bank: data.bank?.name };
+
+    if (data.Status === 'NOT FOUND') {
+      console.warn('[YRG BG] BIN API — 미등록 BIN:', bin);
+      return { valid: false, bin, reason: '유효하지 않은 카드번호 (BIN 미등록)' };
+    }
+
+    if (data.Status !== 'SUCCESS') {
+      console.warn('[YRG BG] BIN API — 알 수 없는 응답:', bin, data.Status);
+      return { valid: true, skip: true, reason: `BIN API 응답 오류: ${data.Status}` };
+    }
+
+    // Issuer와 Country 모두 없으면 실존 카드사 확인 불가 → 차단
+    const hasIssuer = !!data.Issuer;
+    const hasCountry = Array.isArray(data.Country) ? data.Country.length > 0 : !!data.Country?.A2;
+    if (!hasIssuer && !hasCountry) {
+      console.warn('[YRG BG] BIN API — 발급사/국가 정보 없음 (실존 카드사 미확인):', bin);
+      return { valid: false, bin, reason: '유효하지 않은 카드번호 (발급사 확인 불가)' };
+    }
+
+    console.log('[YRG BG] BIN 검증 통과 — API 확인:', bin, data.Scheme, data.Issuer);
+    return { valid: true, bin, scheme: data.Scheme, country: data.Country?.A2, bank: data.Issuer, source: 'api' };
   } catch (err) {
     clearTimeout(timeoutId);
-    if (err.name === 'AbortError') return { valid: true, skip: true, reason: 'BIN API 타임아웃' };
+    if (err.name === 'AbortError') {
+      console.warn('[YRG BG] BIN API 타임아웃 — 검증 스킵:', bin);
+      return { valid: true, skip: true, reason: 'BIN API 타임아웃' };
+    }
+    console.warn('[YRG BG] BIN API 네트워크 오류 — 검증 스킵:', bin, err.message);
     return { valid: true, skip: true, reason: err.message };
   }
 }

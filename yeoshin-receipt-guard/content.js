@@ -1,4 +1,4 @@
-// content.js — 어드민 페이지 DOM 주입 + 이미지 분석 + 결과 UI
+﻿// content.js — 어드민 페이지 DOM 주입 + 이미지 분석 + 결과 UI
 
 (function init() {
   try {
@@ -65,20 +65,46 @@ function findReceiptColumnIndex() {
 function isReceiptImage(img) {
   if (img.dataset.yrgInjected) return false;
 
-  // 이미지가 테이블 셀(td) 안에 있는지 확인
+  // ── Mode 1: 목록 페이지 — 테이블 '영수증 사진' 컬럼 ──────────
   const td = img.closest('td');
-  if (!td) return false;
+  if (td) {
+    if (yrgReceiptColIndex === -1) findReceiptColumnIndex();
+    if (yrgReceiptColIndex !== -1) {
+      const tr = td.closest('tr');
+      if (tr) {
+        return Array.from(tr.children).indexOf(td) === yrgReceiptColIndex;
+      }
+    }
+  }
 
-  // 컬럼 인덱스가 캐시되지 않았으면 탐색
-  if (yrgReceiptColIndex === -1) findReceiptColumnIndex();
-  if (yrgReceiptColIndex === -1) return false;
+  // ── Mode 2: 상세 페이지 — '영수증 정보' 섹션 내 이미지만 대상 ──
+  if (window.location.pathname.includes('/reviews/detail/')) {
+    const w = img.naturalWidth  || img.width;
+    const h = img.naturalHeight || img.height;
+    if (w < 80 || h < 80) return false;
 
-  // 이미지가 속한 td의 컬럼 인덱스와 '영수증 사진' 컬럼 인덱스 비교
-  const tr = td.closest('tr');
-  if (!tr) return false;
-  const tdIndex = Array.from(tr.children).indexOf(td);
+    const section = findReceiptInfoSection();
+    return section ? section.contains(img) : false;
+  }
 
-  return tdIndex === yrgReceiptColIndex;
+  return false;
+}
+
+// '영수증 정보' 레이블을 포함하는 섹션 컨테이너 반환
+function findReceiptInfoSection() {
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (node.textContent.trim().includes('영수증 정보')) {
+      let el = node.parentElement;
+      for (let i = 0; i < 6; i++) {
+        if (!el || el === document.body) break;
+        if (el.querySelectorAll('img').length > 0) return el;
+        el = el.parentElement;
+      }
+    }
+  }
+  return null;
 }
 
 function injectVerifyButton(imgEl) {
@@ -152,6 +178,57 @@ function resolveFullSizeURL(imgEl) {
   }
 }
 
+// JPEG EXIF Orientation 태그 파싱 (exif-js 없이 ArrayBuffer 직접 읽기)
+// 반환값: 1=정상, 3=180°, 6=90°CW, 8=90°CCW
+function getExifOrientation(buf) {
+  try {
+    const view = new DataView(buf);
+    if (view.byteLength < 4 || view.getUint16(0) !== 0xFFD8) return 1; // JPEG 아님
+    let offset = 2;
+    while (offset + 4 < view.byteLength) {
+      const marker = view.getUint16(offset);
+      const segLen  = view.getUint16(offset + 2);
+      if (marker === 0xFFE1) { // APP1 = EXIF
+        if (view.getUint32(offset + 4) !== 0x45786966) break; // 'Exif' 아님
+        const tiff = offset + 10;
+        const le   = view.getUint16(tiff) === 0x4949; // 리틀엔디안 여부
+        const ifd  = view.getUint32(tiff + 4, le);
+        const cnt  = view.getUint16(tiff + ifd, le);
+        for (let i = 0; i < cnt; i++) {
+          const tag = view.getUint16(tiff + ifd + 2 + i * 12, le);
+          if (tag === 0x0112) return view.getUint16(tiff + ifd + 2 + i * 12 + 8, le);
+        }
+        break;
+      }
+      if ((marker & 0xFF00) !== 0xFF00) break;
+      offset += 2 + segLen;
+    }
+  } catch {}
+  return 1;
+}
+
+// EXIF Orientation에 따라 Canvas에 회전 보정 적용 후 dataURL 반환
+function applyExifRotation(img, orientation) {
+  const w = img.naturalWidth;
+  const h = img.naturalHeight;
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  if (orientation === 6) {        // 90° CW (모바일 가로 촬영 → 세로 표시)
+    canvas.width = h; canvas.height = w;
+    ctx.translate(h, 0); ctx.rotate(Math.PI / 2);
+  } else if (orientation === 8) { // 90° CCW
+    canvas.width = h; canvas.height = w;
+    ctx.translate(0, w); ctx.rotate(-Math.PI / 2);
+  } else if (orientation === 3) { // 180°
+    canvas.width = w; canvas.height = h;
+    ctx.translate(w, h); ctx.rotate(Math.PI);
+  } else {
+    canvas.width = w; canvas.height = h;
+  }
+  ctx.drawImage(img, 0, 0);
+  return canvas.toDataURL('image/jpeg', 0.92);
+}
+
 async function getImageDataURL(imgEl) {
   const src = resolveFullSizeURL(imgEl);
 
@@ -159,16 +236,40 @@ async function getImageDataURL(imgEl) {
   try {
     const resp = await fetch(src, { credentials: 'omit' });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const blob = await resp.blob();
+    const arrayBuffer = await resp.arrayBuffer();
+    const mimeType = resp.headers.get('content-type') || 'image/jpeg';
+
     // SVG는 Gemini Vision API 미지원 → Canvas 방식으로 PNG 변환
-    if (blob.type === 'image/svg+xml' || /\.svg(\?|$)/i.test(src)) {
+    if (mimeType === 'image/svg+xml' || /\.svg(\?|$)/i.test(src)) {
       throw new Error('SVG 포맷 — Canvas PNG 변환 필요');
     }
-    return await new Promise((resolve, reject) => {
+
+    const orientation = getExifOrientation(arrayBuffer);
+
+    // EXIF 회전 보정 필요 시 Canvas로 변환
+    if (orientation !== 1 && orientation !== 0) {
+      const blobURL = URL.createObjectURL(new Blob([arrayBuffer], { type: mimeType }));
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const corrected = applyExifRotation(img, orientation);
+            console.log('[YRG] EXIF 회전 보정:', orientation, `(${img.naturalWidth}×${img.naturalHeight} → ${orientation === 6 || orientation === 8 ? img.naturalHeight + '×' + img.naturalWidth : img.naturalWidth + '×' + img.naturalHeight})`);
+            URL.revokeObjectURL(blobURL);
+            resolve(corrected);
+          } catch (e) { URL.revokeObjectURL(blobURL); reject(e); }
+        };
+        img.onerror = () => { URL.revokeObjectURL(blobURL); reject(new Error('이미지 로드 실패')); };
+        img.src = blobURL;
+      });
+    }
+
+    // 회전 보정 불필요 → raw blob 그대로 dataURL 변환
+    return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result);
       reader.onerror = reject;
-      reader.readAsDataURL(blob);
+      reader.readAsDataURL(new Blob([arrayBuffer], { type: mimeType }));
     });
   } catch (fetchErr) {
     console.warn('[YRG] fetch 실패, Canvas 방식으로 폴백:', fetchErr.message);
@@ -424,7 +525,14 @@ async function runOCR(dataURL) {
         reject(new Error(response?.error || 'OCR 실패'));
         return;
       }
-      resolve({ text: response.text, approvalNo: response.approvalNo || null, cardBIN: response.cardBIN || null, isReceipt: response.isReceipt !== false });
+      resolve({
+        text: response.text,
+        approvalNo: response.approvalNo || null,
+        cardBIN: response.cardBIN || null,
+        isReceipt: response.isReceipt !== false,
+        merchantName: response.merchantName || null,
+        medicalFlag: response.medicalFlag || '불명'
+      });
     });
   });
 }
@@ -466,9 +574,49 @@ function extractBusinessNumber(text) {
 
 // ── 5. 중복 해시 비교 (background로 위임) ───────────────────
 
-async function compareHash(hash, approvalNo) {
+function findReviewDetailUrl(imgEl) {
+  const BASE = 'https://admin.fastlane.kr/posts/reviews/detail/';
+
+  // 이미 detail 페이지면 그대로 반환
+  if (window.location.pathname.includes('/reviews/detail/')) {
+    return window.location.href;
+  }
+
+  // imgEl 주변 DOM에서 /detail/숫자 링크 탐색 (가장 가까운 조상부터)
+  let el = imgEl;
+  while (el && el !== document.body) {
+    const link = el.querySelector?.('a[href*="/reviews/detail/"]');
+    if (link) {
+      const match = link.href.match(/\/reviews\/detail\/(\d+)/);
+      if (match) return `${BASE}${match[1]}`;
+    }
+    el = el.parentElement;
+  }
+
+  // 페이지 전체에서 imgEl과 가장 가깝게 위치한 detail 링크 탐색
+  const allLinks = [...document.querySelectorAll('a[href*="/reviews/detail/"]')];
+  if (allLinks.length > 0) {
+    // imgEl 위치와 각 링크의 위치를 비교해 가장 가까운 것 선택
+    const imgRect = imgEl.getBoundingClientRect();
+    let closest = null;
+    let minDist = Infinity;
+    for (const a of allLinks) {
+      const r = a.getBoundingClientRect();
+      const dist = Math.hypot(r.left - imgRect.left, r.top - imgRect.top);
+      if (dist < minDist) { minDist = dist; closest = a; }
+    }
+    if (closest) {
+      const match = closest.href.match(/\/reviews\/detail\/(\d+)/);
+      if (match) return `${BASE}${match[1]}`;
+    }
+  }
+
+  return window.location.href;
+}
+
+async function compareHash(hash, approvalNo, reviewUrl) {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: 'MANAGE_HASHES', hash, approvalNo }, (response) => {
+    chrome.runtime.sendMessage({ type: 'MANAGE_HASHES', hash, approvalNo, reviewUrl }, (response) => {
       if (chrome.runtime.lastError || !response) {
         resolve({ isDuplicate: false, error: true });
         return;
@@ -561,6 +709,10 @@ async function step1BizNo(bizNo) {
 async function step2CardBIN(bin) {
   if (!bin) return { pass: true };
   const result = await checkCardBIN(bin).catch(() => ({ valid: true, skip: true }));
+
+  const src = result.source || (result.skip ? 'skip' : 'unknown');
+  console.log(`[YRG] 2단계 BIN 검증 결과: BIN=${bin} valid=${result.valid} source=${src}`, result.reason || result.issuer || result.bank || '');
+
   if (result.valid === false) {
     return {
       pass: false,
@@ -573,8 +725,10 @@ async function step2CardBIN(bin) {
   return { pass: true };
 }
 
-// 3단계: 이미지 위변조 탐지 (EXIF + 픽셀 노이즈 + 중복 해시 + Gemini)
+// 3단계: 이미지 위변조 탐지 (Hard Gate + 종합 스코어링)
 async function step3Tamper(imgEl, dataURL, hashInfo, preloaded = {}) {
+
+  // ── Hard Gate 1: EXIF 편집 툴 감지 ─────────────────────────
   const exifResult = await (preloaded.exif || analyzeEXIF(imgEl).catch(() => ({ isTampered: false, error: true })));
   if (exifResult.isTampered) {
     return {
@@ -584,28 +738,30 @@ async function step3Tamper(imgEl, dataURL, hashInfo, preloaded = {}) {
   }
 
   // 픽셀 노이즈 + 중복 해시 병렬 처리
+  const reviewUrl = findReviewDetailUrl(imgEl);
   const [noiseResult, dupResult] = await Promise.all([
     preloaded.noise || analyzeImageNoise(dataURL).catch(() => ({ isPaintSuspect: false })),
     (hashInfo.hash || hashInfo.approvalNo)
-      ? compareHash(hashInfo.hash, hashInfo.approvalNo).catch(() => ({ isDuplicate: false }))
+      ? compareHash(hashInfo.hash, hashInfo.approvalNo, reviewUrl).catch(() => ({ isDuplicate: false }))
       : Promise.resolve({ isDuplicate: false })
   ]);
 
+  // ── Hard Gate 2: 중복 영수증 ────────────────────────────────
   if (dupResult.isDuplicate) {
     const prevDate = dupResult.savedAt ? new Date(dupResult.savedAt).toLocaleString('ko-KR') : '알 수 없음';
     const reason = dupResult.reason === 'approvalNo' ? '승인번호 일치' : '이미지 유사도 일치';
+    const urlNote = dupResult.reviewUrl ? ` — 원본 후기: ${dupResult.reviewUrl}` : '';
     return {
       pass: false,
-      verdict: { status: 'reject', icon: '🔴', title: '반려', reasons: [`[3단계] 위변조 탐지 — 중복 영수증 (${reason}) — 이전 검증: ${prevDate}`] }
+      verdict: { status: 'reject', icon: '🔴', title: '반려', reasons: [`[3단계] 위변조 탐지 — 중복 영수증 (${reason}) — 이전 검증: ${prevDate}${urlNote}`] }
     };
   }
 
   const tamperResult = await (preloaded.tamper || analyzeTamper(dataURL).catch(() => ({ tamperLevel: 'unknown', error: true })));
-
-  // ── 편집 위치·유형 분류 판정 (주 신호: Gemini, 보조 신호: 픽셀 시그니처) ──────
   const { editLocation, editType } = tamperResult;
 
-  if (editLocation === '거래핵심정보') {
+  // ── Hard Gate 3: 거래 핵심 정보 편집 감지 ───────────────────
+  if (editLocation === '거래핵심정보' && editType === '교체') {
     return {
       pass: false,
       verdict: { status: 'reject', icon: '🔴', title: '반려',
@@ -619,31 +775,13 @@ async function step3Tamper(imgEl, dataURL, hashInfo, preloaded = {}) {
         reasons: ['[3단계] 위변조 탐지 — 카드 정보가 교체 편집된 흔적이 있습니다.'] }
     };
   }
-  // 카드정보 + 은닉 → 개인정보 보호 처리로 간주, tamperLevel 판정으로 진행
 
-  // 픽셀 시그니처 보조 신호 — Gemini 편집부위 미감지 시에만 활용
-  if ((noiseResult.isPaintSuspect || noiseResult.isWhiteEditSuspect) && editLocation === '없음') {
-    const paintReason = noiseResult.isWhiteEditSuspect
-      ? `픽셀 분석: 흰색 덮어쓰기 편집 의심 — 텍스처 영역 안에 균일한 흰색 블록 ${noiseResult.brightBlocks}개 감지`
-      : `픽셀 분석: 편집 도구로 지워진 영역 의심 (이상 블록 ${noiseResult.suspiciousBlocks}개, ${noiseResult.ratio}%)`;
-    console.log('[YRG]', paintReason);
-    const geminiClean = tamperResult.score === 0 && tamperResult.verdict === '정상';
-    const whiteOverwriteDetected = noiseResult.isWhiteEditSuspect;
-    if (whiteOverwriteDetected || (!geminiClean && (!tamperResult.tamperLevel || tamperResult.tamperLevel === 'low' || tamperResult.tamperLevel === 'unknown'))) {
-      tamperResult.tamperLevel = 'medium';
-      if (whiteOverwriteDetected) {
-        // 픽셀이 주 반려 근거 — Gemini 이유 덮어쓰기, score 표시 제거
-        tamperResult.reason = paintReason;
-        tamperResult.score = null;
-        tamperResult.editType = '교체';
-      } else {
-        tamperResult.reason = tamperResult.reason && tamperResult.reason !== '이상 없음'
-          ? `${tamperResult.reason} / ${paintReason}`
-          : paintReason;
-      }
-    }
+  // ── 은닉 Early Return: 새 텍스트 없는 단순 마스킹은 위치 무관 통과 ──
+  if (editType === '은닉') {
+    return { pass: true, tamperResult };
   }
 
+  // ── Hard Gate 4: 다중 영수증 ────────────────────────────────
   if (tamperResult.isMultipleReceipts) {
     return {
       pass: false,
@@ -652,10 +790,39 @@ async function step3Tamper(imgEl, dataURL, hashInfo, preloaded = {}) {
     };
   }
 
-  if (tamperResult.tamperLevel === 'high' || tamperResult.tamperLevel === 'medium') {
+  // ── Scoring Layer ────────────────────────────────────────────
+  // Gemini 기본 점수 (verdict 기반 하한선: 판정과 점수 불일치 방지)
+  let geminiBase = tamperResult.score ?? 0;
+  if (tamperResult.verdict === '위변조') geminiBase = Math.max(geminiBase, 60);
+  else if (tamperResult.verdict === '의심')  geminiBase = Math.max(geminiBase, 30);
+
+  let totalScore = geminiBase;
+  const scoreBreakdown = [];
+  if (geminiBase > 0) scoreBreakdown.push(`Gemini ${geminiBase}점`);
+
+  // 픽셀 Modifier 1: 편집 도구 지움 흔적 (단독 신호, +15)
+  if (noiseResult.isPaintSuspect) {
+    totalScore += 15;
+    scoreBreakdown.push(`픽셀 편집흔적 +15 (이상블록 ${noiseResult.suspiciousBlocks}개, ${noiseResult.ratio}%)`);
+  }
+  // 픽셀 Modifier 2: 흰색 덮어쓰기 (Gemini 이상 소견 있을 때만 반영, +20)
+  if (noiseResult.isWhiteEditSuspect && geminiBase > 0) {
+    totalScore += 20;
+    scoreBreakdown.push(`픽셀 흰색덮어쓰기 +20 (균일블록 ${noiseResult.brightBlocks}개)`);
+  }
+
+  totalScore = Math.min(totalScore, 100);
+  console.log('[YRG] 종합 위변조 점수:', totalScore, '점 —', scoreBreakdown.join(', ') || 'Gemini 정상');
+
+  if (totalScore >= 50) {
+    const geminiReason = tamperResult.reason && tamperResult.reason !== '이상 없음' ? tamperResult.reason : null;
+    const allReasons = [geminiReason, ...scoreBreakdown].filter(Boolean).join(' / ');
     return {
       pass: false,
-      verdict: { status: 'reject', icon: '🔴', title: '반려', reasons: [tamperResult.score != null ? `[3단계] 위변조 탐지 — ${tamperResult.reason} (신뢰도: ${tamperResult.score}점/100)` : `[3단계] 위변조 탐지 — ${tamperResult.reason}`] },
+      verdict: {
+        status: 'reject', icon: '🔴', title: '반려',
+        reasons: [`[3단계] 위변조 탐지 — ${allReasons} (종합 점수: ${totalScore}점/100)`]
+      },
       tamperResult
     };
   }
@@ -744,7 +911,7 @@ async function verifyReceipt(imgEl, button) {
     if (!r4.pass) { showModal(imgEl, r4.verdict); return; }
 
     // ── 최종 승인 ────────────────────────────────────────────────────
-    const confirmData = (hashResult.hash || approvalNo) ? { hash: hashResult.hash, approvalNo } : null;
+    const confirmData = (hashResult.hash || approvalNo) ? { hash: hashResult.hash, approvalNo, reviewUrl: findReviewDetailUrl(imgEl) } : null;
     showModal(imgEl, {
       status: 'pass', icon: '🟢', title: '최종 승인',
       reasons: buildApprovalReasons(bizNo, cardBIN)
@@ -823,7 +990,7 @@ function showModal(imgEl, verdict, confirmData = null) {
       confirmBtn.disabled = true;
       confirmBtn.textContent = '등록 중...';
       chrome.runtime.sendMessage(
-        { type: 'CONFIRM_HASH', hash: confirmData.hash, approvalNo: confirmData.approvalNo },
+        { type: 'CONFIRM_HASH', hash: confirmData.hash, approvalNo: confirmData.approvalNo, reviewUrl: confirmData.reviewUrl },
         response => {
           confirmBtn.textContent = response?.success ? '✅ 등록 완료' : '❌ 등록 실패';
         }
