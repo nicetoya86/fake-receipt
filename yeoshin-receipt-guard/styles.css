@@ -195,3 +195,236 @@
   cursor: default;
   opacity: 0.8;
 }
+
+/* ── 시뮬레이션 UI ──────────────────────────────────────────── */
+
+/* 목록 페이지: 시뮬레이션 시작 버튼 (body 포털 — fixed 고정) */
+.yrg-sim-start-btn {
+  position: fixed;
+  bottom: 20px;
+  left: 20px;
+  z-index: 9999;
+  padding: 7px 16px;
+  background: #7c3aed;
+  color: #fff;
+  border: none;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Apple SD Gothic Neo', sans-serif;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  transition: background 0.15s, transform 0.1s;
+  line-height: 1.4;
+}
+.yrg-sim-start-btn:hover  { background: #6d28d9; transform: translateY(-1px); }
+.yrg-sim-start-btn:active { transform: translateY(0); }
+
+/* 상세 페이지: 진행 뱃지 (우하단 고정) */
+.yrg-sim-progress {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 9998;
+  padding: 8px 16px;
+  background: rgba(124, 58, 237, 0.92);
+  color: #fff;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+}
+
+/* 모달 안 '다음 후기' 버튼 */
+.yrg-sim-next-btn {
+  display: block;
+  width: 100%;
+  margin-top: 10px;
+  padding: 10px 0;
+  background: #7c3aed;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  cursor: pointer;
+  color: #fff;
+  font-weight: 600;
+  transition: background 0.15s;
+}
+.yrg-sim-next-btn:hover { background: #6d28d9; }
+
+/* 모달 안 자동 이동 취소 버튼 */
+.yrg-sim-cancel-btn {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 8px 0;
+  background: #f5f5f5;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  font-size: 12px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  cursor: pointer;
+  color: #888;
+  transition: background 0.15s;
+}
+.yrg-sim-cancel-btn:hover { background: #e8e8e8; color: #555; }
+
+/* 결과 패널 (목록 페이지 상단 고정) */
+.yrg-sim-results-panel {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2147483630;
+  background: #fff;
+  border-bottom: 3px solid #7c3aed;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.18);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Apple SD Gothic Neo', sans-serif;
+  max-height: 65vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.yrg-sim-rh {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 18px;
+  background: #7c3aed;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.yrg-sim-rclose {
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 4px;
+  opacity: 0.8;
+  transition: opacity 0.1s;
+}
+.yrg-sim-rclose:hover { opacity: 1; background: rgba(255, 255, 255, 0.2); }
+
+.yrg-sim-rsummary {
+  display: flex;
+  gap: 24px;
+  padding: 10px 18px;
+  background: #f5f3ff;
+  border-bottom: 1px solid #e9d5ff;
+  font-size: 14px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.yrg-sim-spass   { color: #15803d; }
+.yrg-sim-sreject { color: #b91c1c; }
+
+.yrg-sim-rlist {
+  overflow-y: auto;
+  flex: 1;
+}
+
+/* 결과 카드 */
+.yrg-sim-card {
+  display: flex;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid #e5e7eb;
+}
+.yrg-sim-card:last-child    { border-bottom: none; }
+.yrg-sim-card-pass          { background: #f0fdf4; }
+.yrg-sim-card-reject        { background: #fef2f2; }
+.yrg-sim-card-skip          { background: #fafafa; }
+.yrg-sim-card-error,
+.yrg-sim-card-caution       { background: #fffbeb; }
+
+.yrg-sim-cno {
+  width: 28px;
+  flex-shrink: 0;
+  text-align: right;
+  font-size: 14px;
+  font-weight: 700;
+  color: #6b7280;
+  padding-top: 1px;
+}
+
+.yrg-sim-cinfo {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.yrg-sim-crow {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.yrg-sim-clabel {
+  width: 68px;
+  flex-shrink: 0;
+  color: #9ca3af;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  padding-top: 2px;
+}
+
+.yrg-sim-curl {
+  color: #4f46e5;
+  text-decoration: none;
+  font-size: 12px;
+  word-break: break-all;
+  line-height: 1.5;
+}
+.yrg-sim-curl:hover { text-decoration: underline; }
+
+.yrg-sim-cverdict   { font-weight: 700; font-size: 13px; }
+.yrg-sim-cv-pass    { color: #15803d; }
+.yrg-sim-cv-reject  { color: #b91c1c; }
+.yrg-sim-cv-skip    { color: #6b7280; }
+.yrg-sim-cv-error,
+.yrg-sim-cv-caution { color: #b45309; }
+
+.yrg-sim-creason {
+  color: #374151;
+  font-size: 13px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+/* 하단 액션 버튼 */
+.yrg-sim-ract {
+  display: flex;
+  gap: 8px;
+  padding: 10px 18px;
+  border-top: 1px solid #e5e7eb;
+  flex-shrink: 0;
+}
+.yrg-sim-copy,
+.yrg-sim-json,
+.yrg-sim-clear {
+  padding: 6px 14px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  background: #f9fafb;
+  color: #374151;
+  font-weight: 500;
+  transition: background 0.15s;
+}
+.yrg-sim-copy:hover  { background: #ede9fe; border-color: #c4b5fd; color: #5b21b6; }
+.yrg-sim-json:hover  { background: #f3f4f6; }
+.yrg-sim-clear:hover { background: #fee2e2; border-color: #fca5a5; color: #991b1b; }

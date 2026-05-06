@@ -1,10 +1,17 @@
 ﻿// content.js — 어드민 페이지 DOM 주입 + 이미지 분석 + 결과 UI
 
+// ── 0. 전역 상수 (IIFE 이전 초기화 — TDZ 방지) ────────────────
+const SIM_KEY = 'yrgSimulation';
+let _simActive = false;
+
+// ── 1. 초기화 ─────────────────────────────────────────────────
+
 (function init() {
   try {
     // lib/exif.js, lib/blockhash.js 는 manifest content_scripts 에서 먼저 로드됨
     scanAndInject();
     observeDOM();
+    initSimulation();
   } catch (e) {
     console.warn('[YRG] 초기화 오류:', e.message);
   }
@@ -39,6 +46,7 @@ window.addEventListener('resize', updateAllPositions, { passive: true });
 // ── 3. 이미지 탐지 및 버튼 주입 ─────────────────────────────
 
 function scanAndInject() {
+  _yrgReceiptSection = undefined; // 상세 페이지 섹션 캐시 무효화
   document.querySelectorAll('img').forEach(img => {
     if (isReceiptImage(img)) injectVerifyButton(img);
   });
@@ -46,6 +54,9 @@ function scanAndInject() {
 
 // '영수증 사진' 컬럼 인덱스 캐시 (-1 = 미발견)
 let yrgReceiptColIndex = -1;
+// 상세 페이지 영수증 섹션 캐시 (undefined = 미탐색, null = 없음)
+// var 사용: 파일 상단 IIFE보다 먼저 호이스팅되어야 하므로
+var _yrgReceiptSection;
 
 function findReceiptColumnIndex() {
   // 테이블 헤더에서 '영수증 사진' 텍스트를 가진 th/td 위치를 찾아 캐시
@@ -77,34 +88,49 @@ function isReceiptImage(img) {
     }
   }
 
-  // ── Mode 2: 상세 페이지 — '영수증 정보' 섹션 내 이미지만 대상 ──
+  // ── Mode 2: 상세 페이지 — 영수증 섹션 내 이미지만 대상 ──
   if (window.location.pathname.includes('/reviews/detail/')) {
+    const section = findReceiptInfoSection();
+    if (!section) return false;
+
+    if (!section.contains(img)) return false;
+
+    // 섹션 내 이미지 크기 최소 기준 (아이콘 제외)
     const w = img.naturalWidth  || img.width;
     const h = img.naturalHeight || img.height;
-    if (w < 80 || h < 80) return false;
-
-    const section = findReceiptInfoSection();
-    return section ? section.contains(img) : false;
+    return w >= 60 && h >= 60;
   }
 
   return false;
 }
 
-// '영수증 정보' 레이블을 포함하는 섹션 컨테이너 반환
+// '영수증' 텍스트와 이미지를 모두 포함하는 가장 작은 컨테이너 반환
+// (텍스트 노드에서 위로 올라가는 방식 대신, 전체 DOM에서 역방향 탐색)
 function findReceiptInfoSection() {
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-  let node;
-  while ((node = walker.nextNode())) {
-    if (node.textContent.trim().includes('영수증 정보')) {
-      let el = node.parentElement;
-      for (let i = 0; i < 6; i++) {
-        if (!el || el === document.body) break;
-        if (el.querySelectorAll('img').length > 0) return el;
-        el = el.parentElement;
-      }
-    }
+  if (_yrgReceiptSection !== undefined) return _yrgReceiptSection;
+
+  const KEYWORDS = ['영수증 정보', '영수증'];
+
+  // '영수증' 텍스트 + img를 모두 포함하는 컨테이너 후보 수집
+  const candidates = [];
+  document.querySelectorAll('table, div, section, article, td').forEach(el => {
+    if (!el.querySelector('img')) return;
+    if (!KEYWORDS.some(kw => el.textContent.includes(kw))) return;
+    candidates.push(el);
+  });
+
+  if (candidates.length === 0) {
+    console.warn('[YRG] 영수증 섹션 미발견 — 페이지에 영수증 관련 텍스트+이미지 컨테이너 없음');
+    _yrgReceiptSection = null;
+    return null;
   }
-  return null;
+
+  // 가장 작은 컨테이너 (가장 구체적인 섹션) 선택
+  _yrgReceiptSection = candidates.reduce((best, el) =>
+    el.querySelectorAll('*').length < best.querySelectorAll('*').length ? el : best
+  );
+  console.log('[YRG] 영수증 섹션 발견:', _yrgReceiptSection.tagName, _yrgReceiptSection.className?.slice(0, 40));
+  return _yrgReceiptSection;
 }
 
 function injectVerifyButton(imgEl) {
@@ -134,7 +160,7 @@ function injectVerifyButton(imgEl) {
   button.style.right = (window.innerWidth - rect.right + 8) + 'px';
 }
 
-// ── 3. DOM 변경 감시 (동적 페이지 대응) ─────────────────────
+// ── 4. DOM 변경 감시 (동적 페이지 대응) ─────────────────────
 
 function observeDOM() {
   let scanTimer = null;
@@ -145,13 +171,15 @@ function observeDOM() {
     scanTimer = setTimeout(() => {
       yrgReceiptColIndex = -1; // 테이블 재렌더링 시 컬럼 인덱스 재탐색
       scanAndInject();
+      injectSimulationUI(); // 시뮬레이션 버튼 갱신
+      handleSimNavChange(); // 클라이언트 사이드 네비게이션 감지
     }, 400);
   });
 
   observer.observe(document.body, { childList: true, subtree: true });
 }
 
-// ── 4. 이미지 분석 함수 ──────────────────────────────────────
+// ── 5. 이미지 분석 함수 ──────────────────────────────────────
 
 function resolveFullSizeURL(imgEl) {
   // 썸네일 → 원본 이미지 URL 탐색 순서
@@ -349,9 +377,18 @@ async function extractHash(imgEl) {
   }
 }
 
-// ── 5. 픽셀 수준 그림판 편집 탐지 ──────────────────────────────
+// ── 6. 픽셀 수준 그림판 편집 탐지 ──────────────────────────────
 // 원리: 그림판 지우개+재입력 시 편집 영역이 주변 배경 노이즈보다
 //       비정상적으로 균일해짐(분산≈0). 텍스처가 있는 주변 블록과 비교해 탐지.
+
+function neighborMeanVariance(grid, br, bc) {
+  return (
+    grid[br-1][bc-1] + grid[br-1][bc] + grid[br-1][bc+1] +
+    grid[br  ][bc-1]                  + grid[br  ][bc+1] +
+    grid[br+1][bc-1] + grid[br+1][bc] + grid[br+1][bc+1]
+  ) / 8;
+}
+
 async function analyzeImageNoise(dataURL) {
   return new Promise((resolve) => {
     const img = new Image();
@@ -405,11 +442,7 @@ async function analyzeImageNoise(dataURL) {
           for (let bc = borderCols; bc < cols - borderCols; bc++) {
             const v = varGrid[br][bc];
             if (v > 1.5) continue;
-            const neighborMean = (
-              varGrid[br-1][bc-1] + varGrid[br-1][bc] + varGrid[br-1][bc+1] +
-              varGrid[br  ][bc-1]                     + varGrid[br  ][bc+1] +
-              varGrid[br+1][bc-1] + varGrid[br+1][bc] + varGrid[br+1][bc+1]
-            ) / 8;
+            const neighborMean = neighborMeanVariance(varGrid, br, bc);
             if (neighborMean > 20 && v < 0.8) suspicious[br][bc] = 1;
           }
         }
@@ -451,11 +484,7 @@ async function analyzeImageNoise(dataURL) {
           for (let bc = borderCols; bc < cols - borderCols; bc++) {
             if (meanGrid[br][bc] < 215) continue;
             const v = varGrid[br][bc];
-            const neighborMean = (
-              varGrid[br-1][bc-1] + varGrid[br-1][bc] + varGrid[br-1][bc+1] +
-              varGrid[br  ][bc-1]                     + varGrid[br  ][bc+1] +
-              varGrid[br+1][bc-1] + varGrid[br+1][bc] + varGrid[br+1][bc+1]
-            ) / 8;
+            const neighborMean = neighborMeanVariance(varGrid, br, bc);
             // 이웃 분산이 충분히 높고(텍스처), 현재 블록이 이웃 대비 매우 균일한 경우
             if (neighborMean > 20 && v < neighborMean * 0.12) brightSusp[br][bc] = 1;
           }
@@ -483,23 +512,42 @@ async function analyzeImageNoise(dataURL) {
   });
 }
 
-// Gemini 전송용 이미지 압축 — 최대 1280px + JPEG 변환 (픽셀 분석용 원본과 분리)
+// Gemini 전송용 이미지 최적화 — 800px 미만 업스케일, 1280px 초과 다운스케일 + JPEG 변환
+// 픽셀 노이즈 분석(analyzeImageNoise)은 원본 dataURL을 그대로 사용하므로 이 함수와 분리됨
 function compressImageForGemini(dataURL) {
-  const MAX = 1280;
+  const MIN_OCR = 800;  // 장변이 이 미만이면 업스케일 → OCR 정확도 향상
+  const MAX_OCR = 1280; // 장변이 이 초과이면 다운스케일 → 전송 크기 절감
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       const w = img.naturalWidth || img.width;
       const h = img.naturalHeight || img.height;
-      const scale = Math.min(1, MAX / Math.max(w, h, 1));
+      const longSide = Math.max(w, h, 1);
+
+      let scale, mode;
+      if (longSide < MIN_OCR) {
+        scale = MAX_OCR / longSide; // 업스케일: 장변을 1280px로
+        mode  = '업스케일';
+      } else {
+        scale = Math.min(1, MAX_OCR / longSide); // 다운스케일 or 유지
+        mode  = scale < 1 ? '다운스케일' : '유지';
+      }
+
       if (scale === 1 && dataURL.startsWith('data:image/jpeg')) { resolve(dataURL); return; }
+
       const canvas = document.createElement('canvas');
       canvas.width  = Math.round(w * scale);
       canvas.height = Math.round(h * scale);
-      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
-      const compressed = canvas.toDataURL('image/jpeg', 0.88);
-      console.log('[YRG] Gemini 이미지 압축:', dataURL.length, '→', compressed.length, `(${Math.round(compressed.length / dataURL.length * 100)}%)`);
-      resolve(compressed);
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled  = true;
+      ctx.imageSmoothingQuality  = 'high';
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+      // 업스케일 시 JPEG 품질 높임 — 보간 결과물에 압축 아티팩트 최소화
+      const quality = mode === '업스케일' ? 0.95 : 0.88;
+      const result  = canvas.toDataURL('image/jpeg', quality);
+      console.log(`[YRG] Gemini 이미지 ${mode}: ${w}×${h} → ${canvas.width}×${canvas.height} (${Math.round(scale * 100)}%, q=${quality})`);
+      resolve(result);
     };
     img.onerror = () => resolve(dataURL);
     img.src = dataURL;
@@ -542,7 +590,7 @@ function extractBusinessNumber(text) {
 
   // OCR 오인식 교정: 숫자처럼 생긴 문자 치환
   // 앞뒤가 숫자인 경우에만 치환해 한글/영문 오염 방지
-  const ctxReplace = (char, replacement) => (c, offset, str) => {
+  const ctxReplace = (replacement) => (c, offset, str) => {
     const prev = str[offset - 1];
     const next = str[offset + 1];
     return (/\d/.test(prev) || /\d/.test(next)) ? replacement : c;
@@ -552,12 +600,12 @@ function extractBusinessNumber(text) {
     .replace(/\r\n|\r/g, '\n')           // 줄바꿈 정규화
     .replace(/[Oo]/g,  '0')             // O/o → 0
     .replace(/[lI|]/g, '1')             // l/I/| → 1
-    .replace(/[Ss]/g, ctxReplace('S', '5')) // S → 5 (문맥 조건)
-    .replace(/[Zz]/g, ctxReplace('Z', '2')) // Z → 2
-    .replace(/[Bb]/g, ctxReplace('B', '8')) // B → 8
-    .replace(/[Gg]/g, ctxReplace('G', '6')) // G → 6
-    .replace(/[q]/g,  ctxReplace('q', '9')) // q → 9
-    .replace(/[Tt]/g, ctxReplace('T', '7')); // T → 7 (드물지만 7과 혼동)
+    .replace(/[Ss]/g, ctxReplace('5')) // S → 5 (문맥 조건)
+    .replace(/[Zz]/g, ctxReplace('2')) // Z → 2
+    .replace(/[Bb]/g, ctxReplace('8')) // B → 8
+    .replace(/[Gg]/g, ctxReplace('6')) // G → 6
+    .replace(/[q]/g,  ctxReplace('9')) // q → 9
+    .replace(/[Tt]/g, ctxReplace('7')); // T → 7 (드물지만 7과 혼동)
 
   const results = new Set();
 
@@ -572,7 +620,7 @@ function extractBusinessNumber(text) {
   return [...results].filter(n => n.length === 10);
 }
 
-// ── 5. 중복 해시 비교 (background로 위임) ───────────────────
+// ── 7. 중복 해시 비교 (background로 위임) ───────────────────
 
 function findReviewDetailUrl(imgEl) {
   const BASE = 'https://admin.fastlane.kr/posts/reviews/detail/';
@@ -626,7 +674,7 @@ async function compareHash(hash, approvalNo, reviewUrl) {
   });
 }
 
-// ── 6. 시각적 위변조 분석 (background로 위임) ─────────────────
+// ── 8. 시각적 위변조 분석 (background로 위임) ─────────────────
 
 async function analyzeTamper(dataURL) {
   return new Promise((resolve) => {
@@ -642,7 +690,7 @@ async function analyzeTamper(dataURL) {
   });
 }
 
-// ── 7. 카드 BIN 검증 (background로 위임) ─────────────────────
+// ── 9. 카드 BIN 검증 (background로 위임) ─────────────────────
 
 async function checkCardBIN(bin) {
   return new Promise((resolve) => {
@@ -658,7 +706,7 @@ async function checkCardBIN(bin) {
   });
 }
 
-// ── 7. 국세청 API 검증 (background로 위임) ───────────────────
+// ── 10. 국세청 API 검증 (background로 위임) ──────────────────
 
 async function verifyBusinessNumber(bizNo) {
   return new Promise((resolve, reject) => {
@@ -680,7 +728,7 @@ async function verifyBusinessNumber(bizNo) {
   });
 }
 
-// ── 7. 순차 검증 단계 함수 ──────────────────────────────────────
+// ── 11. 순차 검증 단계 함수 ─────────────────────────────────────
 
 // 1단계: 사업자등록번호 계속사업자 확인
 async function step1BizNo(bizNo) {
@@ -758,17 +806,23 @@ async function step3Tamper(imgEl, dataURL, hashInfo, preloaded = {}) {
   }
 
   const tamperResult = await (preloaded.tamper || analyzeTamper(dataURL).catch(() => ({ tamperLevel: 'unknown', error: true })));
-  const { editLocation, editType } = tamperResult;
+  const { editLocation, editType, isScreenshot } = tamperResult;
+
+  // ── 화면 캡처 면제: Hard Gate 3·4 건너뜀 ────────────────────
+  // 스크린샷 자체는 편집이 아니므로 캡처 판정 시 편집 게이트를 우회
+  if (isScreenshot) {
+    console.log('[YRG] 화면 캡처 이미지 — Hard Gate 3·4 면제');
+  }
 
   // ── Hard Gate 3: 거래 핵심 정보 편집 감지 ───────────────────
-  if (editLocation === '거래핵심정보' && editType === '교체') {
+  if (!isScreenshot && editLocation === '거래핵심정보' && editType === '교체') {
     return {
       pass: false,
       verdict: { status: 'reject', icon: '🔴', title: '반려',
         reasons: [`[3단계] 위변조 탐지 — 거래 핵심 정보(거래일시·금액·가맹점 등)가 편집된 흔적이 있습니다. (편집유형: ${editType})`] }
     };
   }
-  if (editLocation === '카드정보' && editType === '교체') {
+  if (!isScreenshot && editLocation === '카드정보' && editType === '교체') {
     return {
       pass: false,
       verdict: { status: 'reject', icon: '🔴', title: '반려',
@@ -847,7 +901,7 @@ function buildApprovalReasons(bizNo, cardBIN) {
   return reasons;
 }
 
-// ── 8. 메인 검증 흐름 ───────────────────────────────────────
+// ── 12. 메인 검증 흐름 ──────────────────────────────────────
 
 async function verifyReceipt(imgEl, button) {
   const { apiKey } = await chrome.storage.local.get('apiKey');
@@ -931,7 +985,7 @@ async function verifyReceipt(imgEl, button) {
   }
 }
 
-// ── 9. UI 함수 ──────────────────────────────────────────────
+// ── 13. UI 함수 ─────────────────────────────────────────────
 
 function showSpinner(button) {
   button.disabled = true;
@@ -950,6 +1004,25 @@ function escapeHTML(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#x27;');
+}
+
+function createConfirmButton(confirmData) {
+  const btn = document.createElement('button');
+  btn.className = 'yrg-modal-confirm-btn';
+  btn.type = 'button';
+  btn.textContent = '✅ 후기 승인 완료 등록';
+  btn.title = '후기를 승인한 경우 클릭 — 이후 동일 영수증 재검증 시 반려 처리됩니다';
+  btn.addEventListener('click', () => {
+    btn.disabled = true;
+    btn.textContent = '등록 중...';
+    chrome.runtime.sendMessage(
+      { type: 'CONFIRM_HASH', hash: confirmData.hash, approvalNo: confirmData.approvalNo, reviewUrl: confirmData.reviewUrl },
+      response => {
+        btn.textContent = response?.success ? '✅ 등록 완료' : '❌ 등록 실패';
+      }
+    );
+  });
+  return btn;
 }
 
 function showModal(imgEl, verdict, confirmData = null) {
@@ -981,22 +1054,12 @@ function showModal(imgEl, verdict, confirmData = null) {
   document.body.appendChild(overlay);
 
   if (confirmData) {
-    const confirmBtn = document.createElement('button');
-    confirmBtn.className = 'yrg-modal-confirm-btn';
-    confirmBtn.type = 'button';
-    confirmBtn.textContent = '✅ 후기 승인 완료 등록';
-    confirmBtn.title = '후기를 승인한 경우 클릭 — 이후 동일 영수증 재검증 시 반려 처리됩니다';
-    confirmBtn.addEventListener('click', () => {
-      confirmBtn.disabled = true;
-      confirmBtn.textContent = '등록 중...';
-      chrome.runtime.sendMessage(
-        { type: 'CONFIRM_HASH', hash: confirmData.hash, approvalNo: confirmData.approvalNo, reviewUrl: confirmData.reviewUrl },
-        response => {
-          confirmBtn.textContent = response?.success ? '✅ 등록 완료' : '❌ 등록 실패';
-        }
-      );
-    });
-    modal.insertBefore(confirmBtn, modal.querySelector('.yrg-modal-close'));
+    modal.insertBefore(createConfirmButton(confirmData), modal.querySelector('.yrg-modal-close'));
+  }
+
+  // 시뮬레이션 모드: 다음 후기 버튼 추가
+  if (_simActive) {
+    attachSimNextButton(modal, verdict);
   }
 
   modal.querySelector('.yrg-modal-close').addEventListener('click', () => overlay.remove());
@@ -1006,4 +1069,473 @@ function showModal(imgEl, verdict, confirmData = null) {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') overlay.remove();
   }, { once: true });
+}
+
+// ── 14. 시뮬레이션 모드 ──────────────────────────────────────
+
+function getSimState() {
+  return new Promise(resolve =>
+    chrome.storage.local.get(SIM_KEY, d => resolve(d[SIM_KEY] || null))
+  );
+}
+function saveSimState(s) {
+  return new Promise(resolve => chrome.storage.local.set({ [SIM_KEY]: s }, resolve));
+}
+function clearSimState() {
+  return new Promise(resolve => chrome.storage.local.remove(SIM_KEY, resolve));
+}
+
+// 초기화 진입점 — init() 에서 호출
+async function initSimulation() {
+  const isDetail = window.location.pathname.includes('/reviews/detail/');
+  const sim = await getSimState();
+
+  if (isDetail && sim?.active) {
+    // URL 모드: 현재 페이지 ID 확인 / 버튼 모드: 상세 페이지이면 바로 진행
+    if (sim.mode === 'button') {
+      _simActive = true;
+      showSimProgress(sim.currentIndex + 1, sim.totalCount);
+      setTimeout(() => waitForVerifyButton(sim, 0), 1500);
+    } else {
+      const curId = window.location.pathname.match(/\/detail\/(\d+)/)?.[1];
+      const expId = sim.urls[sim.currentIndex]?.match(/\/detail\/(\d+)/)?.[1];
+      if (curId === expId) {
+        _simActive = true;
+        showSimProgress(sim.currentIndex + 1, sim.totalCount);
+        setTimeout(() => waitForVerifyButton(sim, 0), 1500);
+      }
+    }
+  } else if (!isDetail && sim?.active && sim.mode === 'button') {
+    // 목록 페이지 복귀 (버튼 모드): 다음 "상세 보기" 버튼 자동 클릭
+    showSimProgress(sim.currentIndex + 1, sim.totalCount);
+    setTimeout(() => autoClickDetailButton(sim, 0), 1500);
+  } else if (!isDetail) {
+    setTimeout(injectSimulationUI, 800);
+  }
+}
+
+// 목록 페이지: 시뮬레이션 시작 버튼 주입 (body 포털 방식 — DOM 구조 불변)
+function injectSimulationUI() {
+  if (window.location.pathname.includes('/reviews/detail/')) return;
+
+  let btn = document.getElementById('yrg-sim-btn');
+  if (!btn) {
+    btn = document.createElement('button');
+    btn.id = 'yrg-sim-btn';
+    btn.className = 'yrg-sim-start-btn';
+    btn.addEventListener('click', onSimClick);
+    document.body.appendChild(btn); // React 재렌더링에 영향받지 않도록 body 직접 추가
+
+    // 완료된 결과가 있으면 결과 패널 표시 후 즉시 스토리지 초기화
+    // (새로고침 시 재표시 방지 — 패널은 현재 세션에서만 유지)
+    getSimState().then(sim => {
+      if (sim && !sim.active && sim.results?.length > 0) {
+        clearSimState();
+        injectResultsPanel(sim);
+      }
+    });
+  }
+
+  // 링크/버튼 수 갱신 (DOM 변경 시마다)
+  const { count } = collectDetailItems();
+  btn.textContent = `🤖 순차 검증 (${count}건)`;
+}
+
+// <a href> 링크 우선, 없으면 "상세 보기" 버튼으로 폴백
+function collectDetailItems() {
+  const seen = new Set();
+
+  // Strategy 1: <a> 태그 href
+  const links = [...document.querySelectorAll('a[href*="/reviews/detail/"]')]
+    .map(a => a.href)
+    .filter(url => seen.has(url) ? false : (seen.add(url), true));
+  if (links.length > 0) return { mode: 'url', count: links.length, items: links };
+
+  // Strategy 2: "상세 보기" 버튼 (React 클라이언트 사이드 네비게이션)
+  // replace(/\s+/g, ' ').trim() — 줄바꿈·다중 공백·nbsp 등 정규화
+  const btns = [...document.querySelectorAll('button')]
+    .filter(b => b.textContent.replace(/\s+/g, ' ').trim() === '상세 보기');
+  if (btns.length > 0) return { mode: 'button', count: btns.length, items: btns };
+
+  return { mode: 'none', count: 0, items: [] };
+}
+
+async function onSimClick() {
+  const { mode, count, items } = collectDetailItems();
+  if (count === 0) {
+    alert('[YRG] 현재 페이지에서 검증할 후기를 찾을 수 없습니다.\n검색 필터를 확인해 주세요.');
+    return;
+  }
+
+  if (mode === 'url') {
+    await saveSimState({
+      active: true, mode: 'url',
+      urls: items, totalCount: count,
+      currentIndex: 0, results: [],
+      listUrl: window.location.href, startedAt: Date.now()
+    });
+    window.location.href = items[0];
+  } else {
+    // 버튼 모드: "상세 보기" 버튼 클릭 → 클라이언트 사이드 네비게이션
+    await saveSimState({
+      active: true, mode: 'button',
+      totalCount: count, currentIndex: 0,
+      results: [], listUrl: window.location.href, startedAt: Date.now()
+    });
+    items[0].click();
+  }
+}
+
+// 버튼 주변 DOM에서 리뷰 ID 추출 (data-* 속성 및 인접 텍스트 탐색)
+function extractReviewIdFromButton(btn) {
+  let el = btn.parentElement;
+  for (let depth = 0; depth < 12 && el && el !== document.body; depth++, el = el.parentElement) {
+    // data-* 속성에서 5자리 이상 순수 숫자 탐색
+    for (const attr of Array.from(el.attributes)) {
+      if (/^\d{5,}$/.test(attr.value)) {
+        console.log(`[YRG SIM] ID 발견 (depth:${depth} attr:${attr.name}):`, attr.value);
+        return attr.value;
+      }
+    }
+    // 같은 행(tr / 행 역할 div)에서 순수 숫자 텍스트 셀 탐색
+    const siblings = Array.from(el.children || []);
+    for (const sib of siblings) {
+      if (sib === btn || sib.contains(btn)) continue;
+      const txt = sib.textContent.trim();
+      if (/^\d{5,}$/.test(txt)) {
+        console.log(`[YRG SIM] ID 발견 (depth:${depth} sibling):`, txt);
+        return txt;
+      }
+    }
+  }
+  return null;
+}
+
+// 목록 페이지에서 N번째 리뷰 상세 페이지로 이동
+// 1순위: 버튼 주변 ID 추출 → window.location.href (직접 이동)
+// 2순위: 버튼 클릭 → URL 변경 감지
+function autoClickDetailButton(sim, attempt) {
+  const MAX = 30; // 15초
+
+  const { mode, count, items } = collectDetailItems();
+
+  if (attempt === 0 || attempt % 5 === 0) {
+    console.log(`[YRG SIM] autoClick ${attempt}/${MAX} — mode:${mode} 버튼수:${count} 목표:${sim.currentIndex}`);
+  }
+
+  const target = mode === 'button' ? items[sim.currentIndex] : null;
+
+  if (target) {
+    // 1순위: 버튼 주변에서 ID 추출 → 직접 URL 이동
+    if (attempt === 0) {
+      const reviewId = extractReviewIdFromButton(target);
+      if (reviewId) {
+        const detailUrl = `https://admin.fastlane.kr/posts/reviews/detail/${reviewId}`;
+        console.log('[YRG SIM] ID 기반 직접 이동:', detailUrl);
+        window.location.href = detailUrl;
+        return;
+      }
+      // ID 추출 실패 시 진단 로그
+      console.warn('[YRG SIM] ID 추출 실패 — 버튼 조상 속성:', (() => {
+        const info = [];
+        let el = target.parentElement;
+        for (let d = 0; d < 6 && el && el !== document.body; d++, el = el.parentElement) {
+          const attrs = Array.from(el.attributes).map(a => `${a.name}="${a.value.slice(0,30)}"`).join(' ');
+          info.push(`[${d}]${el.tagName}${attrs ? ' ' + attrs : ''}`);
+        }
+        return info.join(' | ');
+      })());
+    }
+
+    // 2순위: 클릭 시도
+    console.log('[YRG SIM] 버튼 클릭 시도:', sim.currentIndex + 1, '/', sim.totalCount);
+    const prevHref = location.href;
+    target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+
+    let checks = 0;
+    const checker = setInterval(() => {
+      checks++;
+      if (location.href !== prevHref) {
+        clearInterval(checker);
+        if (!_simActive && location.pathname.includes('/reviews/detail/')) {
+          _simLastHref = location.href;
+          _simActive = true;
+          showSimProgress(sim.currentIndex + 1, sim.totalCount);
+          setTimeout(() => waitForVerifyButton(sim, 0), 1000);
+        }
+        return;
+      }
+      if (checks === 20) target.click();
+      if (checks >= 40) {
+        clearInterval(checker);
+        console.warn('[YRG SIM] 클릭 후 URL 변경 실패 — 다음 attempt 재시도');
+        setTimeout(() => autoClickDetailButton(sim, attempt + 1), 300);
+      }
+    }, 100);
+    return;
+  }
+
+  if (attempt >= MAX) {
+    console.warn('[YRG SIM] 버튼 탐색 실패 — mode:', mode, 'count:', count);
+    return;
+  }
+  setTimeout(() => autoClickDetailButton(sim, attempt + 1), 500);
+}
+
+// 클라이언트 사이드 네비게이션 감지 — observeDOM() 에서 URL 변경 시 호출
+let _simLastHref = location.href;
+async function handleSimNavChange() {
+  const href = location.href;
+  if (href === _simLastHref) return;
+  _simLastHref = href;
+
+  const isDetail = location.pathname.includes('/reviews/detail/');
+  if (!isDetail || _simActive) return;
+
+  const sim = await getSimState();
+  if (!sim?.active) return;
+
+  _simActive = true;
+  showSimProgress(sim.currentIndex + 1, sim.totalCount);
+  setTimeout(() => waitForVerifyButton(sim, 0), 1500);
+}
+
+// 상세 페이지: 진행 뱃지 표시
+function showSimProgress(current, total) {
+  let el = document.getElementById('yrg-sim-progress');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'yrg-sim-progress';
+    el.className = 'yrg-sim-progress';
+    document.body.appendChild(el);
+  }
+  el.textContent = `🤖 시뮬레이션 ${current} / ${total}`;
+}
+
+// .yrg-verify-btn 이 나타날 때까지 폴링 후 자동 클릭
+// 클라이언트 사이드 네비게이션 시 이미지가 뒤늦게 로드될 수 있으므로 주기적으로 재스캔
+function waitForVerifyButton(sim, attempt) {
+  const MAX = 30; // 15초 (500ms × 30)
+
+  // 매 3회(1.5초)마다 재스캔 — 이미지 로드 완료 후 버튼 미주입 상태 복구
+  if (attempt % 3 === 0) {
+    yrgReceiptColIndex = -1;
+    scanAndInject();
+  }
+
+  const btn = document.querySelector('.yrg-verify-btn:not(:disabled)');
+  if (btn) {
+    setTimeout(() => btn.click(), 200);
+    return;
+  }
+  if (attempt >= MAX) {
+    handleSimNoReceipt(sim);
+    return;
+  }
+  setTimeout(() => waitForVerifyButton(sim, attempt + 1), 500);
+}
+
+async function handleSimNoReceipt(sim) {
+  sim.results.push({
+    index: sim.currentIndex,
+    url: window.location.href,
+    id: window.location.pathname.match(/\/detail\/(\d+)/)?.[1],
+    verdict: 'skip',
+    title: '영수증 없음',
+    reasons: ['영수증 이미지를 찾을 수 없어 건너뜁니다.'],
+    timestamp: new Date().toISOString()
+  });
+  await goSimNext(sim);
+}
+
+async function goSimNext(sim) {
+  sim.currentIndex++;
+  _simActive = false;
+  const total = sim.totalCount ?? sim.urls?.length ?? 0;
+
+  if (sim.currentIndex >= total) {
+    sim.active = false;
+    await saveSimState(sim);
+    window.location.href = sim.listUrl;
+  } else if (sim.mode === 'url') {
+    await saveSimState(sim);
+    window.location.href = sim.urls[sim.currentIndex];
+  } else {
+    // 버튼 모드: 목록 페이지로 복귀 → initSimulation() 이 다음 버튼 클릭
+    await saveSimState(sim);
+    window.location.href = sim.listUrl;
+  }
+}
+
+// showModal() 에서 시뮬레이션 모드일 때 호출 — 결과 저장 + 자동 이동
+async function attachSimNextButton(modal, verdict) {
+  const sim = await getSimState();
+  if (!sim || !sim.active) return;
+
+  sim.results.push({
+    index: sim.currentIndex,
+    url: window.location.href,
+    id: window.location.pathname.match(/\/detail\/(\d+)/)?.[1],
+    verdict: verdict.status,
+    title: verdict.title,
+    reasons: verdict.reasons || [],
+    timestamp: new Date().toISOString()
+  });
+  await saveSimState(sim);
+
+  const total   = sim.totalCount ?? sim.urls?.length ?? 0;
+  const isLast  = sim.currentIndex + 1 >= total;
+  const AUTO_SEC = 4;
+
+  const nextBtn = document.createElement('button');
+  nextBtn.className = 'yrg-sim-next-btn';
+  nextBtn.type = 'button';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'yrg-sim-cancel-btn';
+  cancelBtn.type = 'button';
+  cancelBtn.textContent = '취소';
+
+  let remaining = AUTO_SEC;
+  let cancelled = false;
+
+  const label = () => isLast
+    ? `📊 시뮬레이션 완료 — 결과 보기 (${remaining}초)`
+    : `다음 후기 (${sim.currentIndex + 2}/${total}) → (${remaining}초)`;
+
+  nextBtn.textContent = label();
+
+  // 카운트다운 타이머
+  const tick = setInterval(() => {
+    if (cancelled) { clearInterval(tick); return; }
+    remaining--;
+    if (remaining <= 0) {
+      clearInterval(tick);
+      cancelBtn.remove();
+      goSimNext(sim);
+    } else {
+      nextBtn.textContent = label();
+    }
+  }, 1000);
+
+  nextBtn.addEventListener('click', () => {
+    clearInterval(tick);
+    goSimNext(sim);
+  });
+
+  cancelBtn.addEventListener('click', () => {
+    cancelled = true;
+    clearInterval(tick);
+    cancelBtn.remove();
+    nextBtn.textContent = isLast
+      ? '📊 시뮬레이션 완료 — 결과 보기'
+      : `다음 후기 (${sim.currentIndex + 2}/${total}) →`;
+  });
+
+  const closeBtn = modal.querySelector('.yrg-modal-close');
+  modal.insertBefore(nextBtn, closeBtn);
+  modal.insertBefore(cancelBtn, closeBtn);
+}
+
+// 결과 사유 텍스트 정리 (표시용 / 복사용 분리)
+function formatSimReason(r, forCopy = false) {
+  if (r.verdict === 'pass') {
+    // 복사용은 간결하게, 표시용은 검증 항목 전체 나열
+    if (forCopy) return '이상 없음';
+    return r.reasons.join('\n') || '이상 없음';
+  }
+  if (r.verdict === 'skip') return '영수증 이미지 없음';
+  const cleaned = (r.reasons || [])
+    .map(s => s.replace(/\[.*?\]\s*/g, '').trim())
+    .filter(Boolean);
+  return cleaned.join(forCopy ? ' / ' : '\n') || '사유 없음';
+}
+
+// 목록 페이지: 완료된 시뮬레이션 결과 패널 (카드 형태)
+function injectResultsPanel(sim) {
+  document.getElementById('yrg-sim-results')?.remove();
+
+  const passC   = sim.results.filter(r => r.verdict === 'pass').length;
+  const rejectC = sim.results.filter(r => r.verdict === 'reject').length;
+  const skipC   = sim.results.filter(r => r.verdict === 'skip').length;
+  const otherC  = sim.results.length - passC - rejectC - skipC;
+  const mins    = ((Date.now() - sim.startedAt) / 60000).toFixed(1);
+  const lbl     = v => ({ pass: '✅ 승인', reject: '🔴 반려', skip: '⏭ 건너뜀' })[v] ?? '⚪ 오류';
+
+  const cardsHTML = sim.results.map((r, i) => {
+    const reasonLines = escapeHTML(formatSimReason(r)).replace(/\n/g, '<br>');
+    return `
+      <div class="yrg-sim-card yrg-sim-card-${r.verdict}">
+        <div class="yrg-sim-cno">${i + 1}.</div>
+        <div class="yrg-sim-cinfo">
+          <div class="yrg-sim-crow">
+            <span class="yrg-sim-clabel">후기 url</span>
+            <a href="${escapeHTML(r.url)}" target="_blank" class="yrg-sim-curl">${escapeHTML(r.url)}</a>
+          </div>
+          <div class="yrg-sim-crow">
+            <span class="yrg-sim-clabel">검증 결과</span>
+            <span class="yrg-sim-cverdict yrg-sim-cv-${r.verdict}">${lbl(r.verdict)}</span>
+          </div>
+          <div class="yrg-sim-crow">
+            <span class="yrg-sim-clabel">사유</span>
+            <span class="yrg-sim-creason">${reasonLines}</span>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  const panel = document.createElement('div');
+  panel.id = 'yrg-sim-results';
+  panel.className = 'yrg-sim-results-panel';
+  panel.innerHTML = `
+    <div class="yrg-sim-rh">
+      <span>🤖 순차 검증 완료 &middot; ${sim.results.length}건 처리 &middot; ${mins}분 소요</span>
+      <button class="yrg-sim-rclose" type="button">✕</button>
+    </div>
+    <div class="yrg-sim-rsummary">
+      <span class="yrg-sim-spass">✅ 승인 <b>${passC}</b></span>
+      <span class="yrg-sim-sreject">🔴 반려 <b>${rejectC}</b></span>
+      ${skipC  ? `<span>⏭ 건너뜀 <b>${skipC}</b></span>` : ''}
+      ${otherC ? `<span>⚪ 오류 <b>${otherC}</b></span>`  : ''}
+    </div>
+    <div class="yrg-sim-rlist">${cardsHTML}</div>
+    <div class="yrg-sim-ract">
+      <button class="yrg-sim-copy" type="button">📋 텍스트 복사</button>
+      <button class="yrg-sim-json" type="button">{ } JSON 복사</button>
+      <button class="yrg-sim-clear" type="button">🗑 결과 삭제</button>
+    </div>
+  `;
+
+  document.body.insertBefore(panel, document.body.firstChild);
+
+  panel.querySelector('.yrg-sim-rclose').addEventListener('click', () => panel.remove());
+
+  // 텍스트 복사 (예시 형식)
+  panel.querySelector('.yrg-sim-copy').addEventListener('click', () => {
+    const text = sim.results.map((r, i) => {
+      const verdictText = { pass: '승인', reject: '반려', skip: '건너뜀' }[r.verdict] ?? '오류';
+      const reason = formatSimReason(r, true);
+      return `${i + 1}.\n- 후기 url: ${r.url}\n- 검증 결과: ${verdictText}\n- 사유: ${reason}`;
+    }).join('\n\n');
+    navigator.clipboard.writeText(text).then(() => {
+      const b = panel.querySelector('.yrg-sim-copy');
+      b.textContent = '✅ 복사됨!';
+      setTimeout(() => b.textContent = '📋 텍스트 복사', 2000);
+    });
+  });
+
+  // JSON 복사
+  panel.querySelector('.yrg-sim-json').addEventListener('click', () => {
+    navigator.clipboard.writeText(JSON.stringify(sim.results, null, 2)).then(() => {
+      const b = panel.querySelector('.yrg-sim-json');
+      b.textContent = '✅ 복사됨!';
+      setTimeout(() => b.textContent = '{ } JSON 복사', 2000);
+    });
+  });
+
+  panel.querySelector('.yrg-sim-clear').addEventListener('click', async () => {
+    await clearSimState();
+    panel.remove();
+  });
 }

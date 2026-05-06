@@ -37,10 +37,11 @@ function formatBizNo(digits) {
 // 시각적으로 혼동하기 쉬운 숫자 쌍 (단계별)
 // 1단계: 가장 흔한 1↔4 혼동만
 const SIMILAR_STAGE1 = { '1': ['4'], '4': ['1'] };
-// 2단계: 확장 혼동 집합 ('0'→'1' 포함: 저해상도에서 0이 1로 오독)
+// 2단계: 확장 혼동 집합
+// '0'→'9' 추가: 저해상도에서 9의 꼬리가 사라지면 0으로 오독 (예: 398→308)
 const SIMILAR_STAGE2 = {
-  '0': ['6', '1'], '1': ['4','7'], '3': ['8'], '4': ['1','7'],
-  '5': ['6'], '6': ['0','5'], '7': ['1','4'], '8': ['3','6','9'], '9': ['8']
+  '0': ['6', '1', '9'], '1': ['4','7'], '3': ['8'], '4': ['1','7'],
+  '5': ['6'], '6': ['0','5'], '7': ['1','4'], '8': ['3','6','9'], '9': ['8', '0']
 };
 
 // 시각적으로 유사한 숫자 치환 중 체크섬 통과 후보 반환
@@ -425,6 +426,9 @@ const TAMPER_PROMPT = `한국 카드 영수증 이미지의 위변조 여부를 
    - 모니터·TV·스마트폰 화면을 촬영하거나 캡처한 이미지인지 판단
    - 픽셀 격자 패턴(모아레), 화면 베젤·UI 요소 흔적, 반사광
    - 실제 종이 영수증 특유의 열인쇄 노이즈·구겨짐·배경 없이 완벽한 흰 배경
+   - [화면 캡처 판정 시 필수 규칙]
+     * 화면 캡처 또는 화면 촬영으로 판단된 경우: 편집부위를 반드시 "없음", 편집유형을 반드시 "없음"으로 설정하세요
+     * 화면 캡처 자체는 편집 행위가 아닙니다 — 캡처된 화면 내 텍스트가 그림판 등으로 추가 편집된 명백한 흔적이 있을 때만 예외
 5. AI 생성 여부:
    - DALL-E, Midjourney, Stable Diffusion 등 생성형 AI로 만든 이미지인지 판단
    - AI 생성 특징: 폰트/글씨가 지나치게 균일, 열인쇄 노이즈·잉크번짐·구겨짐 전혀 없음
@@ -448,9 +452,10 @@ const TAMPER_PROMPT = `한국 카드 영수증 이미지의 위변조 여부를 
    - 블러, 모자이크, 검정/흰색으로 단순히 가린 경우(새 텍스트 없음): "은닉"
    - 편집 없음: "없음"
 
-답변은 반드시 아래 형식 여덟 줄로만:
+답변은 반드시 아래 형식 아홉 줄로만:
 위변조_점수: 0-100
 판정: 정상|의심|위변조
+화면캡처: 예|아니오
 도용_의심: 예|아니오
 AI생성_의심: 예|아니오
 다중영수증: 예|아니오
@@ -463,7 +468,8 @@ function parseTamperResult(raw) {
   const score   = parseInt(raw.match(/위변조_점수:\s*(\d+)/)?.[1] ?? '0');
   const verdict = raw.match(/판정:\s*(정상|의심|위변조)/)?.[1] ?? '정상';
   const reason  = raw.match(/이유:\s*(.+)/)?.[1]?.trim() ?? '이상 없음';
-  const isSuspectedStolen = raw.match(/도용_의심:\s*(예|아니오)/)?.[1] === '예';
+  const isScreenshot        = raw.match(/화면캡처:\s*(예|아니오)/)?.[1] === '예';
+  const isSuspectedStolen   = raw.match(/도용_의심:\s*(예|아니오)/)?.[1] === '예';
   const isSuspectedAI       = raw.match(/AI생성_의심:\s*(예|아니오)/)?.[1] === '예';
   const isMultipleReceipts  = raw.match(/다중영수증:\s*(예|아니오)/)?.[1] === '예';
   const editLocation        = raw.match(/편집부위:\s*(없음|카드정보|거래핵심정보)/)?.[1] ?? '없음';
@@ -472,7 +478,7 @@ function parseTamperResult(raw) {
   if (verdict === '위변조' && score >= 90) tamperLevel = 'high';
   else if (verdict === '위변조' || verdict === '의심') tamperLevel = 'medium';
   else tamperLevel = 'low';
-  return { tamperLevel, score, verdict, reason, isSuspectedStolen, isSuspectedAI, isMultipleReceipts, editLocation, editType, success: true };
+  return { tamperLevel, score, verdict, reason, isScreenshot, isSuspectedStolen, isSuspectedAI, isMultipleReceipts, editLocation, editType, success: true };
 }
 
 async function analyzeVisualTamper(dataURL) {
@@ -536,6 +542,14 @@ function extractCardBINText(raw) {
   return null;                                         // 5자리 이하 (비정상) → 스킵
 }
 
+// OCR 응답에서 사업자번호 외 부가 필드를 누락 시 채우는 헬퍼
+function fillMissingOCRFields(fields, rawText) {
+  if (!fields.approvalNo)          fields.approvalNo  = extractApprovalNoText(rawText);
+  if (!fields.cardBIN)             fields.cardBIN     = extractCardBINText(rawText);
+  if (!fields.merchantName)        fields.merchantName = extractMerchantNameText(rawText);
+  if (fields.medicalFlag === '불명') fields.medicalFlag = extractMedicalFlagText(rawText);
+}
+
 async function geminiOCRFromDataURL(dataURL) {
   const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
   if (!geminiApiKey) return { success: false, error: 'NO_GEMINI_KEY' };
@@ -552,30 +566,31 @@ async function geminiOCRFromDataURL(dataURL) {
     return { success: true, isReceipt: false, text: '없음', approvalNo: null, cardBIN: null };
   }
 
-  let text = extractBizNoText(rawText);
-  let approvalNo = extractApprovalNoText(rawText);
-  let cardBIN = extractCardBINText(rawText);
-  let merchantName = extractMerchantNameText(rawText);
-  let medicalFlag = extractMedicalFlagText(rawText);
-  console.log('[YRG BG] 상호명 추출:', merchantName || '없음', '/ 의료기관여부:', medicalFlag);
+  const fields = {
+    text:         extractBizNoText(rawText),
+    approvalNo:   extractApprovalNoText(rawText),
+    cardBIN:      extractCardBINText(rawText),
+    merchantName: extractMerchantNameText(rawText),
+    medicalFlag:  extractMedicalFlagText(rawText),
+  };
+  console.log('[YRG BG] 상호명 추출:', fields.merchantName || '없음', '/ 의료기관여부:', fields.medicalFlag);
 
   // "없음" 처리: 같은 프롬프트로 1차 재시도 (비결정적 특성 활용, 2/3 확률 성공)
-  if (text === '없음') {
+  if (fields.text === '없음') {
     console.log('[YRG BG] 1차 없음, STANDARD 재시도...');
     rawText = await callGeminiOCR(geminiApiKey, base64, mimeType, STANDARD_PROMPT);
-    text = extractBizNoText(rawText);
-    if (!approvalNo) approvalNo = extractApprovalNoText(rawText);
-    if (!cardBIN) cardBIN = extractCardBINText(rawText);
-    if (!merchantName) merchantName = extractMerchantNameText(rawText);
-    if (medicalFlag === '불명') medicalFlag = extractMedicalFlagText(rawText);
+    fields.text = extractBizNoText(rawText);
+    fillMissingOCRFields(fields, rawText);
   }
   // 여전히 "없음"이면 다른 프롬프트로 2차 재시도
-  if (text === '없음') {
+  if (fields.text === '없음') {
     console.log('[YRG BG] 2차 없음, CAREFUL 재시도...');
     rawText = await callGeminiOCR(geminiApiKey, base64, mimeType, CAREFUL_PROMPT);
-    text = extractBizNoText(rawText);
-    if (!approvalNo) approvalNo = extractApprovalNoText(rawText);
+    fields.text = extractBizNoText(rawText);
+    if (!fields.approvalNo) fields.approvalNo = extractApprovalNoText(rawText);
   }
+
+  const { text, approvalNo, cardBIN, merchantName, medicalFlag } = fields;
 
   console.log('[YRG BG] 승인번호 추출:', approvalNo || '없음');
   console.log('[YRG BG] 카드BIN 추출:', cardBIN || '없음');
