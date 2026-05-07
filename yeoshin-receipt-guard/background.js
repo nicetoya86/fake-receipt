@@ -236,6 +236,10 @@ const STATUS_MAP = {
   '03': { status: 'suspended',    statusText: '휴업자' }
 };
 
+// NTS API 결과 메모리 캐시 (서비스워커 세션 내 유지, 1시간 TTL)
+const _ntsCache = new Map();
+const NTS_CACHE_TTL_MS = 60 * 60 * 1000;
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'MANAGE_HASHES') {
     manageReceiptHashes(message.hash, message.approvalNo, message.reviewUrl)
@@ -531,15 +535,17 @@ function extractApprovalNoText(raw) {
 }
 
 // Gemini 응답에서 카드 BIN 추출
-// 영수증 노출 자릿수: 앞 4자리 → 4자리 그대로, 앞 6자리 → 6자리 그대로, 앞 8자리 → 앞 6자리
+// 영수증 노출 형식: "950002", "9500-02", "4210-29" 등 대시 포함 형식 모두 처리
+// 앞 6자리 이상 → 앞 6자리, 앞 4자리만 노출된 경우 → 4자리 (브랜드 식별용)
 function extractCardBINText(raw) {
   if (!raw) return null;
-  const match = raw.match(/카드BIN:\s*(\d{4,8})/);
+  // 대시 포함 형식(예: 9500-02, 4210-29) 및 연속 숫자 형식(예: 950002) 모두 캡처
+  const match = raw.match(/카드BIN:\s*(\d{4}[-\s]?\d{2,4}|\d{4,8})/);
   if (!match) return null;
-  const digits = match[1];
-  if (digits.length >= 6) return digits.slice(0, 6); // 6~8자리 → 앞 6자리
-  if (digits.length === 4) return digits;              // 앞 4자리 → 그대로 (브랜드 식별용)
-  return null;                                         // 5자리 이하 (비정상) → 스킵
+  const digits = match[1].replace(/\D/g, ''); // 대시·공백 제거 후 숫자만
+  if (digits.length >= 6) return digits.slice(0, 6); // 6자리 이상 → 앞 6자리
+  if (digits.length === 4) return digits;             // 앞 4자리만 노출된 경우 → 브랜드 식별용
+  return null;                                        // 5자리 (비정상) → 스킵
 }
 
 // OCR 응답에서 사업자번호 외 부가 필드를 누락 시 채우는 헬퍼
@@ -575,16 +581,9 @@ async function geminiOCRFromDataURL(dataURL) {
   };
   console.log('[YRG BG] 상호명 추출:', fields.merchantName || '없음', '/ 의료기관여부:', fields.medicalFlag);
 
-  // "없음" 처리: 같은 프롬프트로 1차 재시도 (비결정적 특성 활용, 2/3 확률 성공)
+  // "없음"이면 CAREFUL 프롬프트로 단일 재시도 (STANDARD 중복 재시도 제거 — 속도 개선)
   if (fields.text === '없음') {
-    console.log('[YRG BG] 1차 없음, STANDARD 재시도...');
-    rawText = await callGeminiOCR(geminiApiKey, base64, mimeType, STANDARD_PROMPT);
-    fields.text = extractBizNoText(rawText);
-    fillMissingOCRFields(fields, rawText);
-  }
-  // 여전히 "없음"이면 다른 프롬프트로 2차 재시도
-  if (fields.text === '없음') {
-    console.log('[YRG BG] 2차 없음, CAREFUL 재시도...');
+    console.log('[YRG BG] 없음, CAREFUL 재시도...');
     rawText = await callGeminiOCR(geminiApiKey, base64, mimeType, CAREFUL_PROMPT);
     fields.text = extractBizNoText(rawText);
     if (!fields.approvalNo) fields.approvalNo = extractApprovalNoText(rawText);
@@ -623,10 +622,13 @@ async function geminiOCRFromDataURL(dataURL) {
       }
       return diffCount === 1 && digits[diffPos] === '4' && candidate[diffPos] === '1';
     });
-    const best = preferred ?? fixes[0];
-    const corrected = formatBizNo(best);
-    console.log('[YRG BG] 우선순위 선택:', corrected, preferred ? '(4→1)' : '(첫번째 후보)');
-    return { success: true, text: corrected, approvalNo, cardBIN, merchantName, medicalFlag };
+    if (preferred) {
+      const corrected = formatBizNo(preferred);
+      console.log('[YRG BG] 우선순위 선택 (4→1):', corrected);
+      return { success: true, text: corrected, approvalNo, cardBIN, merchantName, medicalFlag };
+    }
+    console.log('[YRG BG] 다수 후보 모호, 원본 반환:', text);
+    return { success: true, text, approvalNo, cardBIN, merchantName, medicalFlag };
   }
 
   return { success: true, text, approvalNo, cardBIN, merchantName, medicalFlag };
@@ -820,6 +822,13 @@ async function verifyCardBIN(bin) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async function verifyWithNTS(bizNo) {
+  // 메모리 캐시 확인 (1시간 TTL — 동일 사업자번호 반복 검증 시 API 생략)
+  const _cached = _ntsCache.get(bizNo);
+  if (_cached && _cached.expiresAt > Date.now()) {
+    console.log('[YRG BG] NTS 캐시 히트:', bizNo);
+    return _cached.result;
+  }
+
   const { apiKey } = await chrome.storage.local.get('apiKey');
 
   if (!apiKey) {
@@ -848,12 +857,15 @@ async function verifyWithNTS(bizNo) {
     const item = data?.data?.[0];
 
     if (!item) {
-      return { success: true, bizNo, status: 'unregistered', statusText: '국세청미등록' };
+      const result = { success: true, bizNo, status: 'unregistered', statusText: '국세청미등록' };
+      _ntsCache.set(bizNo, { result, expiresAt: Date.now() + NTS_CACHE_TTL_MS });
+      return result;
     }
 
     const mapped = STATUS_MAP[item.b_stt_cd] || { status: 'unregistered', statusText: '국세청미등록' };
-
-    return { success: true, bizNo, ...mapped, taxType: item.tax_type || '', endDate: item.end_dt || '' };
+    const result = { success: true, bizNo, ...mapped, taxType: item.tax_type || '', endDate: item.end_dt || '' };
+    _ntsCache.set(bizNo, { result, expiresAt: Date.now() + NTS_CACHE_TTL_MS });
+    return result;
 
   } catch (err) {
     clearTimeout(timeoutId);

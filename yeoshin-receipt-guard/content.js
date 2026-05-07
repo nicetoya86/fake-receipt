@@ -811,7 +811,8 @@ async function step3Tamper(imgEl, dataURL, hashInfo, preloaded = {}) {
   // ── 화면 캡처 면제: Hard Gate 3·4 건너뜀 ────────────────────
   // 스크린샷 자체는 편집이 아니므로 캡처 판정 시 편집 게이트를 우회
   if (isScreenshot) {
-    console.log('[YRG] 화면 캡처 이미지 — Hard Gate 3·4 면제');
+    console.log('[YRG] 화면 캡처 이미지 — 모든 반려 조건 면제');
+    return { pass: true, tamperResult };
   }
 
   // ── Hard Gate 3: 거래 핵심 정보 편집 감지 ───────────────────
@@ -854,15 +855,27 @@ async function step3Tamper(imgEl, dataURL, hashInfo, preloaded = {}) {
   const scoreBreakdown = [];
   if (geminiBase > 0) scoreBreakdown.push(`Gemini ${geminiBase}점`);
 
-  // 픽셀 Modifier 1: 편집 도구 지움 흔적 (단독 신호, +15)
+  // 픽셀 Modifier 1: 편집 도구 지움 흔적 — 의심 강도에 따라 가중치 증가
+  // 강신호(ratio≥6% 또는 blocks≥30): 컴퓨터 폰트 직접 교체 등 큰 편집 영역 커버
+  // 약신호(ratio 4~5%, blocks<30): 노이즈·경미한 압축 아티팩트와 구분
   if (noiseResult.isPaintSuspect) {
-    totalScore += 15;
-    scoreBreakdown.push(`픽셀 편집흔적 +15 (이상블록 ${noiseResult.suspiciousBlocks}개, ${noiseResult.ratio}%)`);
+    const heavySignal = noiseResult.ratio >= 6 || noiseResult.suspiciousBlocks >= 30;
+    const pixelScore = heavySignal ? 55 : 15;
+    totalScore += pixelScore;
+    scoreBreakdown.push(`픽셀 편집흔적 +${pixelScore} (이상블록 ${noiseResult.suspiciousBlocks}개, ${noiseResult.ratio}%${heavySignal ? ', 강신호' : ''})`);
   }
-  // 픽셀 Modifier 2: 흰색 덮어쓰기 (Gemini 이상 소견 있을 때만 반영, +20)
-  if (noiseResult.isWhiteEditSuspect && geminiBase > 0) {
+  // 픽셀 Modifier 2: 흰색 덮어쓰기 (+20, Gemini 탐지 여부와 무관하게 반영)
+  // 이전: geminiBase > 0 조건 탓에 Gemini 미탐지 시 0점 — Gemini 오탐 시 픽셀 단독 탐지 불가
+  if (noiseResult.isWhiteEditSuspect) {
     totalScore += 20;
     scoreBreakdown.push(`픽셀 흰색덮어쓰기 +20 (균일블록 ${noiseResult.brightBlocks}개)`);
+  }
+  // 픽셀 Modifier 3: 두 신호 동시 발화 조합 보너스 (+20)
+  // isPaintSuspect(+15) + isWhiteEditSuspect(+20) + 조합(+20) = 55 → 반려 임계(50) 초과
+  // 단일 신호만으로는 최대 35점으로 임계 미달 — 복합 증거 요구로 오탐 방지
+  if (noiseResult.isPaintSuspect && noiseResult.isWhiteEditSuspect) {
+    totalScore += 20;
+    scoreBreakdown.push(`픽셀 복합신호 +20 (편집흔적+흰색교체 동시 탐지)`);
   }
 
   totalScore = Math.min(totalScore, 100);
@@ -929,8 +942,17 @@ async function verifyReceipt(imgEl, button) {
     const exifPromise   = analyzeEXIF(imgEl).catch(() => ({ isTampered: false, error: true }));
     const noisePromise  = analyzeImageNoise(dataURL).catch(() => ({ isPaintSuspect: false }));
 
-    // 압축 완료(~20ms) 후 Gemini 호출 시작 — 노이즈 분석은 원본 유지
-    const geminiImg = await geminiImgPromise;
+    // 압축 + 해시 동시 완료 후 Gemini 호출 시작
+    const [geminiImg, hashResult] = await Promise.all([geminiImgPromise, hashPromise]);
+
+    // 이미지 해시 중복 체크를 OCR과 병렬로 시작 (지연 없음 — OCR 대기 중 완료)
+    let _earlyDupResult = null;
+    if (hashResult.hash) {
+      compareHash(hashResult.hash, null, findReviewDetailUrl(imgEl))
+        .then(r => { _earlyDupResult = r; })
+        .catch(() => {});
+    }
+
     const ocrPromise    = runOCR(geminiImg).catch(e => { if (e.message === 'NO_GEMINI_KEY') throw e; console.warn('[YRG] OCR 오류:', e.message); return null; });
     const tamperPromise = analyzeTamper(geminiImg).catch(() => ({ tamperLevel: 'unknown', error: true }));
 
@@ -940,6 +962,17 @@ async function verifyReceipt(imgEl, button) {
       showModal(imgEl, {
         status: 'reject', icon: '🔴', title: '반려',
         reasons: ['[0단계] 영수증 이미지가 아닙니다 — 카드 영수증 이미지를 업로드해 주세요.']
+      });
+      return;
+    }
+
+    // OCR 대기 중 해시 중복 발견 시 즉시 반려 (NTS·Tamper 불필요)
+    if (_earlyDupResult?.isDuplicate) {
+      const prevDate = _earlyDupResult.savedAt ? new Date(_earlyDupResult.savedAt).toLocaleString('ko-KR') : '알 수 없음';
+      const urlNote = _earlyDupResult.reviewUrl ? ` — 원본 후기: ${_earlyDupResult.reviewUrl}` : '';
+      showModal(imgEl, {
+        status: 'reject', icon: '🔴', title: '반려',
+        reasons: [`[3단계] 위변조 탐지 — 중복 영수증 (이미지 유사도 일치) — 이전 검증: ${prevDate}${urlNote}`]
       });
       return;
     }
@@ -955,7 +988,6 @@ async function verifyReceipt(imgEl, button) {
     if (!r2.pass) { showModal(imgEl, r2.verdict); return; }
 
     // ── 3단계: 이미지 위변조 탐지 (사전 시작된 프로미스 재사용) ───────
-    const hashResult = await hashPromise;
     const hashInfo = { hash: hashResult.hash, approvalNo };
     const r3 = await step3Tamper(imgEl, dataURL, hashInfo, { exif: exifPromise, noise: noisePromise, tamper: tamperPromise });
     if (!r3.pass) { showModal(imgEl, r3.verdict); return; }
