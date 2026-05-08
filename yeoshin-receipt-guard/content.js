@@ -585,6 +585,20 @@ async function runOCR(dataURL) {
   });
 }
 
+// OCR + 위변조 분석을 단일 Gemini 호출로 처리 (background.js geminiOCRAndTamperFromDataURL 경유)
+async function runOCRAndTamper(dataURL) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('OCR+Tamper 요청 타임아웃 (60초)')), 60000);
+    chrome.runtime.sendMessage({ type: 'RUN_OCR_AND_TAMPER', dataURL }, (response) => {
+      clearTimeout(timeout);
+      if (chrome.runtime.lastError) { reject(new Error(chrome.runtime.lastError.message)); return; }
+      if (response?.error === 'NO_GEMINI_KEY') { reject(new Error('NO_GEMINI_KEY')); return; }
+      if (!response?.success) { reject(new Error(response?.error || '분석 실패')); return; }
+      resolve(response);
+    });
+  });
+}
+
 function extractBusinessNumber(text) {
   if (!text) return [];
 
@@ -953,12 +967,11 @@ async function verifyReceipt(imgEl, button) {
         .catch(() => {});
     }
 
-    const ocrPromise    = runOCR(geminiImg).catch(e => { if (e.message === 'NO_GEMINI_KEY') throw e; console.warn('[YRG] OCR 오류:', e.message); return null; });
-    const tamperPromise = analyzeTamper(geminiImg).catch(() => ({ tamperLevel: 'unknown', error: true }));
+    // 단일 통합 호출: OCR + 위변조 분석을 Gemini 1회 호출로 처리 (기존 2회 → 1회)
+    const combined = await runOCRAndTamper(geminiImg).catch(e => { if (e.message === 'NO_GEMINI_KEY') throw e; console.warn('[YRG] OCR+Tamper 오류:', e.message); return null; });
 
-    // OCR 완료 후 비영수증 조기 반려 체크
-    const ocrRaw = await ocrPromise;
-    if (ocrRaw?.isReceipt === false) {
+    // 비영수증 조기 반려
+    if (combined?.isReceipt === false) {
       showModal(imgEl, {
         status: 'reject', icon: '🔴', title: '반려',
         reasons: ['[0단계] 영수증 이미지가 아닙니다 — 카드 영수증 이미지를 업로드해 주세요.']
@@ -966,7 +979,7 @@ async function verifyReceipt(imgEl, button) {
       return;
     }
 
-    // OCR 대기 중 해시 중복 발견 시 즉시 반려 (NTS·Tamper 불필요)
+    // 이미지 해시 중복 발견 시 즉시 반려
     if (_earlyDupResult?.isDuplicate) {
       const prevDate = _earlyDupResult.savedAt ? new Date(_earlyDupResult.savedAt).toLocaleString('ko-KR') : '알 수 없음';
       const urlNote = _earlyDupResult.reviewUrl ? ` — 원본 후기: ${_earlyDupResult.reviewUrl}` : '';
@@ -978,18 +991,18 @@ async function verifyReceipt(imgEl, button) {
     }
 
     // 1·2단계 병렬 실행
-    const bizNumbers = extractBusinessNumber(ocrRaw?.text);
+    const bizNumbers = extractBusinessNumber(combined?.text);
     const bizNo      = bizNumbers[0] || null;
-    const cardBIN    = ocrRaw?.cardBIN    || null;
-    const approvalNo = ocrRaw?.approvalNo || null;
+    const cardBIN    = combined?.cardBIN    || null;
+    const approvalNo = combined?.approvalNo || null;
 
     const [r1, r2] = await Promise.all([step1BizNo(bizNo), step2CardBIN(cardBIN)]);
     if (!r1.pass) { showModal(imgEl, r1.verdict); return; }
     if (!r2.pass) { showModal(imgEl, r2.verdict); return; }
 
-    // ── 3단계: 이미지 위변조 탐지 (사전 시작된 프로미스 재사용) ───────
+    // ── 3단계: 이미지 위변조 탐지 (combined.tamperResult 재사용 — 추가 API 호출 없음) ───
     const hashInfo = { hash: hashResult.hash, approvalNo };
-    const r3 = await step3Tamper(imgEl, dataURL, hashInfo, { exif: exifPromise, noise: noisePromise, tamper: tamperPromise });
+    const r3 = await step3Tamper(imgEl, dataURL, hashInfo, { exif: exifPromise, noise: noisePromise, tamper: combined?.tamperResult });
     if (!r3.pass) { showModal(imgEl, r3.verdict); return; }
 
     // ── 4단계: AI 생성 이미지 탐지 ──────────────────────────────────
