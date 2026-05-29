@@ -3,6 +3,19 @@
 // ── 0. 전역 상수 (IIFE 이전 초기화 — TDZ 방지) ────────────────
 const SIM_KEY = 'yrgSimulation';
 let _simActive = false;
+let _simPaused = false;
+
+// ── 로그 인터셉터: [YRG] 로그를 background 버퍼로 전송 ──────────
+(function _interceptContentLog() {
+  const orig = console.log;
+  console.log = function(...args) {
+    orig.apply(console, args);
+    const msg = args.map(a => (a !== null && typeof a === 'object') ? JSON.stringify(a) : String(a)).join(' ');
+    if (msg.startsWith('[YRG')) {
+      try { chrome.runtime.sendMessage({ type: 'YRG_LOG', msg }); } catch(e) {}
+    }
+  };
+})();
 
 // ── 1. 초기화 ─────────────────────────────────────────────────
 
@@ -12,6 +25,7 @@ let _simActive = false;
     scanAndInject();
     observeDOM();
     initSimulation();
+    injectLogExportPanel();
   } catch (e) {
     console.warn('[YRG] 초기화 오류:', e.message);
   }
@@ -515,21 +529,26 @@ async function analyzeImageNoise(dataURL) {
 // Gemini 전송용 이미지 최적화 — 800px 미만 업스케일, 1280px 초과 다운스케일 + JPEG 변환
 // 픽셀 노이즈 분석(analyzeImageNoise)은 원본 dataURL을 그대로 사용하므로 이 함수와 분리됨
 function compressImageForGemini(dataURL) {
-  const MIN_OCR = 800;  // 장변이 이 미만이면 업스케일 → OCR 정확도 향상
-  const MAX_OCR = 1280; // 장변이 이 초과이면 다운스케일 → 전송 크기 절감
+  const MIN_OCR   = 800;  // 장변이 이 미만이면 업스케일 → OCR 정확도 향상
+  const MAX_OCR   = 1280; // 장변이 이 초과이면 다운스케일 → 전송 크기 절감
+  const MIN_SHORT = 800;  // 단변 최솟값 — 가로형 영수증 다운스케일 시 OCR 보호
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       const w = img.naturalWidth || img.width;
       const h = img.naturalHeight || img.height;
-      const longSide = Math.max(w, h, 1);
+      const longSide  = Math.max(w, h, 1);
+      const shortSide = Math.min(w, h);
 
       let scale, mode;
       if (longSide < MIN_OCR) {
         scale = MAX_OCR / longSide; // 업스케일: 장변을 1280px로
         mode  = '업스케일';
       } else {
-        scale = Math.min(1, MAX_OCR / longSide); // 다운스케일 or 유지
+        const scaleByLong  = Math.min(1, MAX_OCR / longSide);
+        // 단변이 MIN_SHORT 미만으로 줄지 않도록 하한 적용 (단, 업스케일 금지)
+        const scaleByShort = shortSide > 0 ? Math.min(1, MIN_SHORT / shortSide) : 1;
+        scale = Math.max(scaleByLong, scaleByShort);
         mode  = scale < 1 ? '다운스케일' : '유지';
       }
 
@@ -773,18 +792,25 @@ async function step2CardBIN(bin) {
   const result = await checkCardBIN(bin).catch(() => ({ valid: true, skip: true }));
 
   const src = result.source || (result.skip ? 'skip' : 'unknown');
-  console.log(`[YRG] 2단계 BIN 검증 결과: BIN=${bin} valid=${result.valid} source=${src}`, result.reason || result.issuer || result.bank || '');
+  const displayBIN = result.bin || bin;
+  console.log(`[YRG] 2단계 BIN 검증 결과: BIN=${displayBIN} valid=${result.valid} source=${src}`, result.reason || result.issuer || result.bank || '');
 
   if (result.valid === false) {
     return {
       pass: false,
       verdict: {
         status: 'reject', icon: '🔴', title: '반려',
-        reasons: [`[2단계] 카드번호 검증 실패 — ${result.reason || '유효하지 않은 카드번호'}${result.bin ? ` (BIN: ${result.bin})` : ''}`]
+        reasons: [`[2단계] 카드번호 검증 실패 — ${result.reason || '유효하지 않은 카드번호'}${displayBIN ? ` (BIN: ${displayBIN})` : ''}`]
       }
     };
   }
-  return { pass: true };
+  // 시각 유사 교정이 적용된 경우 교정된 BIN을 함께 반환 (표시용)
+  // verified: false이면 카드번호 없는 영수증으로 판단 → 승인 사유에 BIN 미표시
+  return {
+    pass: true,
+    correctedBIN: result.source === 'local-korea-visual-fix' ? result.bin : null,
+    verified: !result.skip
+  };
 }
 
 // 3단계: 이미지 위변조 탐지 (Hard Gate + 종합 스코어링)
@@ -830,18 +856,19 @@ async function step3Tamper(imgEl, dataURL, hashInfo, preloaded = {}) {
   }
 
   // ── Hard Gate 3: 거래 핵심 정보 편집 감지 ───────────────────
-  if (!isScreenshot && editLocation === '거래핵심정보' && editType === '교체') {
+  // score 70 미만은 신뢰도 부족 — Scoring Layer에서 종합 판단 (폰트 차이 오탐 방지)
+  if (!isScreenshot && editLocation === '거래핵심정보' && editType === '교체' && tamperResult.score >= 70) {
     return {
       pass: false,
       verdict: { status: 'reject', icon: '🔴', title: '반려',
-        reasons: [`[3단계] 위변조 탐지 — 거래 핵심 정보(거래일시·금액·가맹점 등)가 편집된 흔적이 있습니다. (편집유형: ${editType})`] }
+        reasons: [`[3단계] 위변조 탐지 — 거래 핵심 정보(거래일시·금액·가맹점 등)가 편집된 흔적이 있습니다. (편집유형: ${editType}, 점수: ${tamperResult.score})`] }
     };
   }
-  if (!isScreenshot && editLocation === '카드정보' && editType === '교체') {
+  if (!isScreenshot && editLocation === '카드정보' && editType === '교체' && tamperResult.score >= 70) {
     return {
       pass: false,
       verdict: { status: 'reject', icon: '🔴', title: '반려',
-        reasons: ['[3단계] 위변조 탐지 — 카드 정보가 교체 편집된 흔적이 있습니다.'] }
+        reasons: [`[3단계] 위변조 탐지 — 카드 정보가 교체 편집된 흔적이 있습니다. (점수: ${tamperResult.score})`] }
     };
   }
 
@@ -860,34 +887,42 @@ async function step3Tamper(imgEl, dataURL, hashInfo, preloaded = {}) {
   }
 
   // ── Scoring Layer ────────────────────────────────────────────
-  // Gemini 기본 점수 (verdict 기반 하한선: 판정과 점수 불일치 방지)
+  // Gemini 기본 점수 (verdict 기반 조정: 판정과 점수 불일치 교정)
   let geminiBase = tamperResult.score ?? 0;
   if (tamperResult.verdict === '위변조') geminiBase = Math.max(geminiBase, 60);
   else if (tamperResult.verdict === '의심')  geminiBase = Math.max(geminiBase, 30);
+  else geminiBase = Math.min(geminiBase, 40); // '정상' 판정: 점수 상한 40 (픽셀 신호 없이 반려 방지)
 
   let totalScore = geminiBase;
   const scoreBreakdown = [];
   if (geminiBase > 0) scoreBreakdown.push(`Gemini ${geminiBase}점`);
 
+  // Gemini가 명시적으로 정상 판정한 경우: 픽셀 기여 가중치 차등 적용
+  // 단, 밝은 균일블록 120개 이상의 강신호는 Gemini 정상 판정 무관하게 강한 점수 부여
+  const isGeminiClear = tamperResult.verdict === '정상';
+
   // 픽셀 Modifier 1: 편집 도구 지움 흔적 — 의심 강도에 따라 가중치 증가
-  // 강신호(ratio≥6% 또는 blocks≥30): 컴퓨터 폰트 직접 교체 등 큰 편집 영역 커버
-  // 약신호(ratio 4~5%, blocks<30): 노이즈·경미한 압축 아티팩트와 구분
+  // Gemini 정상 판정 시: 픽셀 신호 강도와 무관하게 기여 상한 20점 (단독 반려 방지)
+  // 카드번호·개인정보 은닉 처리 시 열전사 노이즈와 구분 불가 → Gemini AI 판정 우선
+  // Gemini 위변조/의심 판정 시: 강신호 +55, 초강신호 +55 (Gemini 탐지와 픽셀 증거 합산)
+  const heavySignal = noiseResult.isPaintSuspect && (noiseResult.ratio >= 6 || noiseResult.suspiciousBlocks >= 30);
+  const superHeavySignal = noiseResult.isPaintSuspect && noiseResult.ratio >= 7 && noiseResult.suspiciousBlocks >= 80;
   if (noiseResult.isPaintSuspect) {
-    const heavySignal = noiseResult.ratio >= 6 || noiseResult.suspiciousBlocks >= 30;
-    const pixelScore = heavySignal ? 55 : 15;
+    const pixelScore = isGeminiClear ? 20 : (superHeavySignal || heavySignal ? 55 : 15);
     totalScore += pixelScore;
-    scoreBreakdown.push(`픽셀 편집흔적 +${pixelScore} (이상블록 ${noiseResult.suspiciousBlocks}개, ${noiseResult.ratio}%${heavySignal ? ', 강신호' : ''})`);
+    scoreBreakdown.push(`픽셀 편집흔적 +${pixelScore} (이상블록 ${noiseResult.suspiciousBlocks}개, ${noiseResult.ratio}%${superHeavySignal ? ', 초강신호' : heavySignal ? ', 강신호' : ''})`);
   }
-  // 픽셀 Modifier 2: 흰색 덮어쓰기 (+20, Gemini 탐지 여부와 무관하게 반영)
-  // 이전: geminiBase > 0 조건 탓에 Gemini 미탐지 시 0점 — Gemini 오탐 시 픽셀 단독 탐지 불가
+  // 픽셀 Modifier 2: 흰색 덮어쓰기 — Gemini 정상 시 +10, 위변조/의심 시 +20
+  // 카드번호 은닉·디지털 영수증 배경·여백 등 정상 패턴도 밝은 클러스터를 다수 생성하므로
+  // Gemini 정상 판정 시 픽셀 단독 가중치를 제한해 오탐 방지
   if (noiseResult.isWhiteEditSuspect) {
-    totalScore += 20;
-    scoreBreakdown.push(`픽셀 흰색덮어쓰기 +20 (균일블록 ${noiseResult.brightBlocks}개)`);
+    const whiteScore = isGeminiClear ? 10 : 20;
+    totalScore += whiteScore;
+    scoreBreakdown.push(`픽셀 흰색덮어쓰기 +${whiteScore} (균일블록 ${noiseResult.brightBlocks}개)`);
   }
   // 픽셀 Modifier 3: 두 신호 동시 발화 조합 보너스 (+20)
-  // isPaintSuspect(+15) + isWhiteEditSuspect(+20) + 조합(+20) = 55 → 반려 임계(50) 초과
-  // 단일 신호만으로는 최대 35점으로 임계 미달 — 복합 증거 요구로 오탐 방지
-  if (noiseResult.isPaintSuspect && noiseResult.isWhiteEditSuspect) {
+  // Gemini가 위변조/의심 판정한 경우에만 활성화 — 정상 판정 시 픽셀 복합신호로 단독 반려 방지
+  if (noiseResult.isPaintSuspect && noiseResult.isWhiteEditSuspect && !isGeminiClear) {
     totalScore += 20;
     scoreBreakdown.push(`픽셀 복합신호 +20 (편집흔적+흰색교체 동시 탐지)`);
   }
@@ -895,7 +930,11 @@ async function step3Tamper(imgEl, dataURL, hashInfo, preloaded = {}) {
   totalScore = Math.min(totalScore, 100);
   console.log('[YRG] 종합 위변조 점수:', totalScore, '점 —', scoreBreakdown.join(', ') || 'Gemini 정상');
 
-  if (totalScore >= 50) {
+  // 반려 조건 1: Gemini '위변조' 판정 + 70점 이상
+  // 반려 조건 2: 픽셀 강신호 단독 반려
+  // '의심' 판정만으로는 자동 반려 불가 — 명확한 '위변조' 판정 + 70점 이상 조합에만 반려
+  // 흰색 패치·스티커가 육안으로 명확한 경우 Hard Gate 3(위)에서 이미 처리됨
+  if (totalScore >= 70 && tamperResult.verdict === '위변조') {
     const geminiReason = tamperResult.reason && tamperResult.reason !== '이상 없음' ? tamperResult.reason : null;
     const allReasons = [geminiReason, ...scoreBreakdown].filter(Boolean).join(' / ');
     return {
@@ -999,6 +1038,8 @@ async function verifyReceipt(imgEl, button) {
     const [r1, r2] = await Promise.all([step1BizNo(bizNo), step2CardBIN(cardBIN)]);
     if (!r1.pass) { showModal(imgEl, r1.verdict); return; }
     if (!r2.pass) { showModal(imgEl, r2.verdict); return; }
+    // r2.verified=false: 카드번호 없는 영수증 → effectiveBIN null로 승인 사유에 미표시
+    const effectiveBIN = r2.correctedBIN || (r2.verified ? cardBIN : null);
 
     // ── 3단계: 이미지 위변조 탐지 (combined.tamperResult 재사용 — 추가 API 호출 없음) ───
     const hashInfo = { hash: hashResult.hash, approvalNo };
@@ -1013,7 +1054,7 @@ async function verifyReceipt(imgEl, button) {
     const confirmData = (hashResult.hash || approvalNo) ? { hash: hashResult.hash, approvalNo, reviewUrl: findReviewDetailUrl(imgEl) } : null;
     showModal(imgEl, {
       status: 'pass', icon: '🟢', title: '최종 승인',
-      reasons: buildApprovalReasons(bizNo, cardBIN)
+      reasons: buildApprovalReasons(bizNo, effectiveBIN)
     }, confirmData);
 
   } catch (err) {
@@ -1140,6 +1181,7 @@ async function initSimulation() {
     if (sim.mode === 'button') {
       _simActive = true;
       showSimProgress(sim.currentIndex + 1, sim.totalCount);
+      if (sim.paused) { _simPaused = true; return; }
       setTimeout(() => waitForVerifyButton(sim, 0), 1500);
     } else {
       const curId = window.location.pathname.match(/\/detail\/(\d+)/)?.[1];
@@ -1147,12 +1189,15 @@ async function initSimulation() {
       if (curId === expId) {
         _simActive = true;
         showSimProgress(sim.currentIndex + 1, sim.totalCount);
+        if (sim.paused) { _simPaused = true; return; }
         setTimeout(() => waitForVerifyButton(sim, 0), 1500);
       }
     }
   } else if (!isDetail && sim?.active && sim.mode === 'button') {
     // 목록 페이지 복귀 (버튼 모드): 다음 "상세 보기" 버튼 자동 클릭
+    _simActive = true;
     showSimProgress(sim.currentIndex + 1, sim.totalCount);
+    if (sim.paused) { _simPaused = true; return; }
     setTimeout(() => autoClickDetailButton(sim, 0), 1500);
   } else if (!isDetail) {
     setTimeout(injectSimulationUI, 800);
@@ -1260,6 +1305,7 @@ function extractReviewIdFromButton(btn) {
 // 1순위: 버튼 주변 ID 추출 → window.location.href (직접 이동)
 // 2순위: 버튼 클릭 → URL 변경 감지
 function autoClickDetailButton(sim, attempt) {
+  if (_simPaused) return;
   const MAX = 30; // 15초
 
   const { mode, count, items } = collectDetailItems();
@@ -1314,7 +1360,7 @@ function autoClickDetailButton(sim, attempt) {
       if (checks >= 40) {
         clearInterval(checker);
         console.warn('[YRG SIM] 클릭 후 URL 변경 실패 — 다음 attempt 재시도');
-        setTimeout(() => autoClickDetailButton(sim, attempt + 1), 300);
+        if (!_simPaused) setTimeout(() => autoClickDetailButton(sim, attempt + 1), 300);
       }
     }, 100);
     return;
@@ -1341,6 +1387,7 @@ async function handleSimNavChange() {
   if (!sim?.active) return;
 
   _simActive = true;
+  if (sim.paused) { _simPaused = true; showSimProgress(sim.currentIndex + 1, sim.totalCount); return; }
   showSimProgress(sim.currentIndex + 1, sim.totalCount);
   setTimeout(() => waitForVerifyButton(sim, 0), 1500);
 }
@@ -1360,6 +1407,7 @@ function showSimProgress(current, total) {
 // .yrg-verify-btn 이 나타날 때까지 폴링 후 자동 클릭
 // 클라이언트 사이드 네비게이션 시 이미지가 뒤늦게 로드될 수 있으므로 주기적으로 재스캔
 function waitForVerifyButton(sim, attempt) {
+  if (_simPaused) return;
   const MAX = 30; // 15초 (500ms × 30)
 
   // 매 3회(1.5초)마다 재스캔 — 이미지 로드 완료 후 버튼 미주입 상태 복구
@@ -1410,6 +1458,38 @@ async function goSimNext(sim) {
     await saveSimState(sim);
     window.location.href = sim.listUrl;
   }
+}
+
+async function pauseSimulation() {
+  _simPaused = true;
+  const sim = await getSimState();
+  if (sim) { sim.paused = true; await saveSimState(sim); }
+}
+
+async function resumeSimulation() {
+  const sim = await getSimState();
+  if (!sim?.active) return;
+  sim.paused = false;
+  await saveSimState(sim);
+  _simPaused = false;
+  const isDetail = window.location.pathname.includes('/reviews/detail/');
+  if (isDetail) {
+    waitForVerifyButton(sim, 0);
+  } else if (sim.mode === 'button') {
+    autoClickDetailButton(sim, 0);
+  } else {
+    window.location.href = sim.urls[sim.currentIndex];
+  }
+}
+
+async function stopSimulation() {
+  _simActive = false;
+  _simPaused = false;
+  const sim = await getSimState();
+  const listUrl = sim?.listUrl;
+  await clearSimState();
+  document.getElementById('yrg-sim-progress')?.remove();
+  if (listUrl) window.location.href = listUrl;
 }
 
 // showModal() 에서 시뮬레이션 모드일 때 호출 — 결과 저장 + 자동 이동
@@ -1582,5 +1662,90 @@ function injectResultsPanel(sim) {
   panel.querySelector('.yrg-sim-clear').addEventListener('click', async () => {
     await clearSimState();
     panel.remove();
+  });
+}
+
+// ── 로그 저장 패널 (상세 페이지 우하단 고정) ─────────────────────
+function injectLogExportPanel() {
+  if (document.getElementById('yrg-log-panel')) return;
+
+  const panel = document.createElement('div');
+  panel.id = 'yrg-log-panel';
+  panel.style.cssText = [
+    'position:fixed', 'bottom:16px', 'right:16px', 'z-index:2147483647',
+    'background:#1e293b', 'color:#f1f5f9', 'border-radius:8px',
+    'padding:8px 12px', 'font-size:12px', 'font-family:monospace',
+    'display:flex', 'align-items:center', 'gap:8px',
+    'box-shadow:0 4px 16px rgba(0,0,0,0.4)',
+  ].join(';');
+
+  const countEl = document.createElement('span');
+  countEl.id = 'yrg-log-count';
+  countEl.textContent = '로그 0건';
+  countEl.style.cssText = 'opacity:0.7;min-width:60px;';
+
+  const saveBtn = document.createElement('button');
+  saveBtn.textContent = '💾 저장';
+  saveBtn.style.cssText = 'background:#3b82f6;color:#fff;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:monospace;';
+
+  const clearBtn = document.createElement('button');
+  clearBtn.textContent = '🗑 초기화';
+  clearBtn.style.cssText = 'background:#475569;color:#fff;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:monospace;';
+
+  const pauseBtn = document.createElement('button');
+  pauseBtn.id = 'yrg-sim-pause-btn';
+  pauseBtn.textContent = '일시정지';
+  pauseBtn.style.cssText = 'background:#f59e0b;color:#fff;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:monospace;';
+  pauseBtn.style.display = 'none';
+  pauseBtn.addEventListener('click', () => {
+    if (_simPaused) resumeSimulation();
+    else pauseSimulation();
+  });
+
+  const stopBtn = document.createElement('button');
+  stopBtn.id = 'yrg-sim-stop-btn';
+  stopBtn.textContent = '중지';
+  stopBtn.style.cssText = 'background:#ef4444;color:#fff;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:monospace;';
+  stopBtn.style.display = 'none';
+  stopBtn.addEventListener('click', () => {
+    if (!confirm('순차 검증을 중지하시겠습니까?')) return;
+    stopSimulation();
+  });
+
+  panel.append(countEl, pauseBtn, stopBtn, saveBtn, clearBtn);
+  document.body.appendChild(panel);
+
+  // 2초마다 카운트 갱신 + 시뮬레이션 버튼 상태 업데이트
+  const countTimer = setInterval(() => {
+    chrome.runtime.sendMessage({ type: 'YRG_LOG_COUNT' }, r => {
+      if (chrome.runtime.lastError) { clearInterval(countTimer); return; }
+      countEl.textContent = `로그 ${r?.count ?? 0}건`;
+    });
+    pauseBtn.style.display = _simActive ? 'inline-block' : 'none';
+    stopBtn.style.display = _simActive ? 'inline-block' : 'none';
+    pauseBtn.textContent = _simPaused ? '다시 시작' : '일시정지';
+  }, 2000);
+
+  saveBtn.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'YRG_DOWNLOAD_LOGS' }, r => {
+      if (!r?.content) { alert('저장할 로그가 없습니다.'); return; }
+      const blob = new Blob([r.content], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
+      const ts = d.toISOString().slice(0, 19).replace('T', '_').replace(/:/g, '');
+      a.href = url;
+      a.download = `yrg-log-${ts}.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+      countEl.textContent = `로그 ${r.count}건 저장됨`;
+    });
+  });
+
+  clearBtn.addEventListener('click', () => {
+    if (!confirm('로그 버퍼를 초기화하시겠습니까?')) return;
+    chrome.runtime.sendMessage({ type: 'YRG_CLEAR_LOGS' }, () => {
+      countEl.textContent = '로그 0건';
+    });
   });
 }

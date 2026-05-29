@@ -1,6 +1,43 @@
 // background.js — Service Worker
 // 국세청 API 통신 전담 (CORS 우회)
 
+// ── 로그 버퍼 (검증 세션 로그 파일 저장용) ──────────────────────────────────────
+// SW 재시작 시에도 로그가 유지되도록 chrome.storage.local에 영속화
+const _yrgLogBuffer = [];
+let _yrgPersistTimer = null;
+
+function _yrgKSTTimestamp() {
+  const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  return d.toISOString().slice(0, 23).replace('T', ' ') + ' KST';
+}
+
+// SW 재시작 시 기존 로그 복원
+chrome.storage.local.get('_yrgLogs', d => {
+  if (Array.isArray(d?._yrgLogs)) _yrgLogBuffer.push(...d._yrgLogs);
+});
+
+// 500ms 디바운스로 storage에 일괄 저장 (매 로그마다 I/O 방지)
+function _yrgPersist() {
+  clearTimeout(_yrgPersistTimer);
+  _yrgPersistTimer = setTimeout(() => {
+    chrome.storage.local.set({ _yrgLogs: [..._yrgLogBuffer] });
+  }, 500);
+}
+
+function _yrgAddLog(msg) {
+  _yrgLogBuffer.push(`[${_yrgKSTTimestamp()}] ${msg}`);
+  _yrgPersist();
+}
+
+(function _interceptBgLog() {
+  const orig = console.log;
+  console.log = function(...args) {
+    orig.apply(console, args);
+    const msg = args.map(a => (a !== null && typeof a === 'object') ? JSON.stringify(a) : String(a)).join(' ');
+    if (msg.startsWith('[YRG')) _yrgAddLog(msg);
+  };
+})();
+
 // base64 magic bytes로 실제 이미지 포맷 탐지
 function normalizeMimeType(rawMime, base64) {
   const SUPPORTED = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];
@@ -44,6 +81,20 @@ const SIMILAR_STAGE2 = {
   '5': ['6'], '6': ['0','5'], '7': ['1','4'], '8': ['3','6','9'], '9': ['8', '0']
 };
 
+// CAREFUL 응답 전체에서 체크섬 유효한 사업자번호 탐색 (응답이 짧아 전체 스캔 안전)
+// 하이픈(-) 외 공백·점(.)으로 구분된 형식도 정규화하여 탐색
+function findValidBizNoInText(raw) {
+  if (!raw) return null;
+  // 공백·점 구분자를 하이픈으로 정규화 (예: "014 15 32077", "014.15.32077" → "014-15-32077")
+  const normalized = raw.replace(/(?<!\d)(\d{3})[\s.](\d{2})[\s.](\d{5})(?!\d)/g, '$1-$2-$3');
+  const re = /(?<!\d)\d{3}-\d{2}-\d{5}(?!\d)/g;
+  let m;
+  while ((m = re.exec(normalized)) !== null) {
+    if (validateKoreanBizNo(m[0].replace(/\D/g, ''))) return m[0];
+  }
+  return null;
+}
+
 // 시각적으로 유사한 숫자 치환 중 체크섬 통과 후보 반환
 function findVisualFix(digits, similarMap) {
   const candidates = new Set();
@@ -57,25 +108,31 @@ function findVisualFix(digits, similarMap) {
 }
 
 // Gemini 응답에서 사업자번호 패턴만 추출 (레이블·설명 제거)
+// 허용 형식: NNN-NN-NNNNN (하이픈), NNN NN NNNNN (공백), NNN.NN.NNNNN (점) → 모두 하이픈 형식으로 정규화
+function normalizeBizNoSeparator(text) {
+  // 공백·점 구분자를 하이픈으로 정규화 (단, 이미 하이픈인 경우 무변환)
+  return text.replace(/(?<!\d)(\d{3})[\s.](\d{2})[\s.](\d{5})(?!\d)/g, '$1-$2-$3');
+}
+
 function extractBizNoText(raw) {
   if (!raw) return '없음';
 
   // '사업자번호:' 레이블 다음 값 우선 추출
   const labelMatch = raw.match(/사업자번호:\s*([^\n]+)/);
-  const candidate = labelMatch ? labelMatch[1].trim() : '';
 
-  // candidate에서 NNN-NN-NNNNN 매칭
-  if (candidate) {
+  if (labelMatch) {
+    // 레이블을 찾은 경우 — 레이블 값에서만 추출 (전체 탐색 금지: 위변조 분석 텍스트 오염 방지)
+    const candidate = normalizeBizNoSeparator(labelMatch[1].trim());
     const m = candidate.match(/(?<!\d)\d{3}-\d{2}-\d{5}(?!\d)/);
     if (m) return m[0];
-    if (candidate.includes('없음')) return '없음';
+    return '없음';
   }
 
-  // 전체 raw에서 NNN-NN-NNNNN 재탐색
-  const fullMatch = raw.match(/(?<!\d)\d{3}-\d{2}-\d{5}(?!\d)/);
+  // 레이블 자체가 없는 경우에만 전체 텍스트 탐색 (구형 응답 포맷 대응)
+  const normalized = normalizeBizNoSeparator(raw);
+  const fullMatch = normalized.match(/(?<!\d)\d{3}-\d{2}-\d{5}(?!\d)/);
   if (fullMatch) return fullMatch[0];
 
-  // 유효한 번호 없으면 없음 반환 (전체 텍스트 반환 금지)
   return '없음';
 }
 
@@ -318,6 +375,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'PING') {
     sendResponse({ status: 'ok' });
   }
+
+  // ── 로그 버퍼 관리 ──────────────────────────────────────────
+  if (message.type === 'YRG_LOG') {
+    _yrgAddLog(message.msg);
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.type === 'YRG_LOG_COUNT') {
+    sendResponse({ count: _yrgLogBuffer.length });
+    return false;
+  }
+
+  if (message.type === 'YRG_DOWNLOAD_LOGS') {
+    const now = _yrgKSTTimestamp();
+    const header = [
+      '=== YRG 검증 로그 ===',
+      `저장 시각: ${now}`,
+      `총 항목: ${_yrgLogBuffer.length}개`,
+      '================================',
+      '',
+    ].join('\n');
+    sendResponse({ content: header + _yrgLogBuffer.join('\n'), count: _yrgLogBuffer.length });
+    return false;
+  }
+
+  if (message.type === 'YRG_CLEAR_LOGS') {
+    _yrgLogBuffer.length = 0;
+    chrome.storage.local.remove('_yrgLogs');
+    sendResponse({ ok: true });
+    return false;
+  }
 });
 
 // ── 이미지 fetch ──────────────────────────────────────────────────────────────
@@ -341,6 +430,8 @@ const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/
 const GEMINI_TIMEOUT_MS = 30000;
 
 const STANDARD_PROMPT = `[중요] 이미지가 90°/180°/270° 회전된 상태일 수 있습니다. 텍스트 방향과 무관하게 각 항목의 레이블을 먼저 정확히 찾은 뒤, 그 레이블 바로 옆·아래에 붙어있는 값만 추출하세요. 레이블 없이 추측하지 마세요.
+
+[정확성 원칙] 이미지에 실제로 명확하게 인쇄된 내용만 답하세요. 흐릿하거나 부분적으로만 보여 확실하지 않은 항목은 "없음"으로 답하세요. 추측하거나 만들어내지 마세요.
 
 한국 카드 영수증 이미지에서 다음 여섯 가지를 확인해주세요.
 
@@ -369,22 +460,27 @@ const STANDARD_PROMPT = `[중요] 이미지가 90°/180°/270° 회전된 상태
    - 사업자번호는 반드시 정확히 NNN-NN-NNNNN (3자리-2자리-5자리) 형식이어야 하며, 슬래시 왼쪽 숫자의 일부를 앞자리로 사용하지 마세요
    - 전화번호(02-, 010/011/016/017/018/019로 시작)와 혼동하지 마세요
    - 카드사(한국신용카드결제, KOCES 등)가 아닌 가맹점 번호를 찾으세요
-   - 영수증 전체를 꼼꼼히 읽어 NNN-NN-NNNNN 패턴이 하나라도 있으면 반드시 추출하고, 진짜로 없을 때만 "없음"으로 답하세요
+   - NNN-NN-NNNNN 형식이 이미지에 명확하게 인쇄되어 있으면 추출하세요. 흐릿하거나 확실하지 않으면 "없음"으로 답하세요
 
 4. 카드 승인번호 (숫자 6~10자리)
    - 반드시 "승인번호", "승인 번호", "승인No", "Approval No" 레이블 바로 옆에 있는 숫자만 추출하세요
    - 카드사명이 괄호로 붙어있을 수 있음 (예: 승인번호(삼성카드))
    - 숫자만 추출하세요 (공백·[CC] 등 기호 제거)
    - [절대 금지] 카드번호(XXXX-XXXX-****-**** 형식)의 일부를 승인번호로 추출하지 마세요. 카드번호 앞 8자리(예: 9410-6186)를 승인번호로 오인하지 마세요
+   - 레이블이 명확히 보이지 않거나 숫자가 불확실하면 "없음"으로 답하세요
 
 5. 카드번호 앞 자리 (BIN)
    - "카드번호", "Card No", "승인카드번호" 레이블 옆에 있음
+   - [핵심 규칙] 첫 번째 * 또는 마스킹 기호가 나오기 전까지 연속으로 표시된 모든 숫자를 추출하세요
+   - 예시: "5434 12** **** ****" → "543412", "4033-1234-****-****" → "403312", "5377-****-****-****" → "5377"
    - 영수증마다 보이는 자릿수가 다릅니다. 자릿수별 처리 규칙:
      * 앞 4자리만 표시된 경우 (예: XXXX-****-****-****): 그 4자리를 추출하세요 (예: "4234")
      * 앞 6자리 표시된 경우 (예: XXXX-XX**-****-****): 그 6자리를 추출하세요 (예: "423456")
      * 앞 8자리 표시된 경우 (예: XXXX-XXXX-****-****): 앞 6자리만 추출하세요 (예: "423456")
    - 마스킹(*) 처리된 자리는 무시하고, 숫자로 표시된 앞 자리만 추출하세요
-   - 카드번호 자체가 없으면 "없음" 기재
+   - 카드번호 레이블이 명확하지 않으면 "없음" 기재
+   - [OCR 혼동 주의] 카드번호에서 오인하기 쉬운 숫자 쌍: 5↔6, 0↔6, 0↔9, 1↔7, 3↔8. 카드번호는 금융 정보이므로 각 자리를 픽셀 수준에서 하나씩 신중하게 확인하세요
+   - 한 자리라도 확실하지 않으면 전체를 "없음"으로 답하세요 — 불확실한 숫자로 오답을 제출하지 마세요
 
 답변은 반드시 아래 형식 여섯 줄로만:
 영수증여부: 예|아니오
@@ -395,39 +491,59 @@ const STANDARD_PROMPT = `[중요] 이미지가 90°/180°/270° 회전된 상태
 카드BIN: XXXX 또는 XXXXXX
 (없으면 해당 항목에 "없음" 기재)`;
 
-// 1차와 다른 프롬프트로 재시도 — 힌트 없이 신중하게 읽기만 요청
-const CAREFUL_PROMPT = `한국 카드 영수증에서 두 가지를 찾아주세요. 저해상도일 수 있으니 각 숫자를 천천히 읽으세요.
-사업자등록번호는 레이블("사업자번호" 등) 없이 XXX-XX-XXXXX 형식만 있어도 추출하세요. 단 전화번호(02-, 010- 등)는 제외하세요.
+// 1차와 다른 프롬프트로 재시도 — 영수증 전체를 적극적으로 스캔
+const CAREFUL_PROMPT = `한국 카드 영수증 이미지에서 사업자등록번호와 승인번호를 찾아주세요.
+
+[중요] 이미지의 모든 영역을 처음부터 끝까지 빠짐없이 스캔하세요. 작은 글씨, 하단 인쇄, 표 안의 숫자도 모두 확인하세요.
+
+사업자등록번호 찾는 법:
+1. 이미지 전체를 처음부터 끝까지 스캔하여 "NNN-NN-NNNNN" (3자리-대시-2자리-대시-5자리, 총 10자리) 형식의 숫자를 모두 찾으세요
+2. "사업자번호", "사업자등록번호", "Biz No", "사업자" 레이블 옆에 있는 NNN-NN-NNNNN 숫자를 최우선으로 선택하세요
+3. 레이블이 없어도 영수증 어디서든 이 형식이 보이면 추출하세요
+4. NNN-NN-NNNNN 형식의 숫자가 여러 개 보이면 쉼표로 구분하여 모두 나열하세요 (예: XXX-XX-XXXXX, YYY-YY-YYYYY)
+- 전화번호(02-, 010/011/016~019로 시작)는 절대 포함하지 마세요
+- 대시(-)가 없는 연속 숫자는 무시하세요
+- 형식에 맞는 숫자가 보이면 반드시 포함하세요 — 놓치지 마세요
+- 이미지에 이 형식의 숫자가 정말 없다면 "없음"으로 답하세요
 
 답변은 반드시 아래 형식 두 줄로만:
-사업자번호: XXX-XX-XXXXX
-승인번호: XXXXXXXX
+사업자번호: XXX-XX-XXXXX  ← 여러 개면 쉼표로 나열, 없으면 "없음"
+승인번호: XXXXXXXX  ← 없으면 "없음"
 (없으면 해당 항목에 "없음" 기재)`;
 
 // ── 위변조 탐지 프롬프트 ─────────────────────────────────────────────────────────
 
 const TAMPER_PROMPT = `한국 카드 영수증 이미지의 위변조 여부를 분석해주세요.
 
+[위변조 판정 원칙]
+- "정상" 판정은 거래일시·금액·가맹점명 세 필드를 각각 적극적으로 확인하여 이상이 없음을 확인한 경우에만 사용하세요 — 이상을 발견하지 못했다는 이유만으로 "정상"으로 판정하지 마세요
+- 불확실하거나 확인이 충분하지 않으면 "의심"(위변조_점수 30-59)으로 판정하세요
+- 위변조_점수 0은 기본값이 아닙니다 — 모든 핵심 필드를 실제로 검토하여 완전히 이상이 없음을 확인한 경우에만 사용하세요
+- 위변조로 판정하려면 ①배경 이질성(흰색 덮어쓰기 흔적) 또는 ②폰트 기술 차이(비트맵↔안티앨리어싱 혼재) 중 하나의 명확한 물리적 증거가 필요합니다
+- "위변조"는 확실한 물리적 증거가 있는 경우에만 사용하세요 — 애매하거나 미세한 차이는 반드시 "의심"으로 판정하세요. 위변조로 단정하기 어려우면 의심 판정이 더 안전합니다
+
 [검토 항목]
 1. 숫자·텍스트 편집 흔적 (최우선 — 가장 세밀하게 검토):
    - 금액(합계·소계·부가세·공급가액)·날짜·사업자번호·승인번호 각 필드를 개별적으로 집중 검토
-   - 같은 줄·같은 필드 안에서 숫자 간 폰트 크기·굵기·자간·기울기·획 두께가 일치하는지 비교
+   - 검토 핵심: 기존 인쇄된 내용 위에 새로운 데이터(숫자·텍스트)가 덧씌워졌는지 여부 — 폰트 크기·굵기 차이만으로는 편집 흔적으로 판단하지 마세요
    - 그림판(mspaint) 지우개+텍스트 도구 패턴: 특정 숫자 아래·주변에 배경보다 더 균일하고 깨끗한 직사각형 영역이 있는지
    - 안티앨리어싱 부재: 원본 열인쇄 텍스트는 가장자리에 미세한 회색 픽셀이 있으나, 그림판 추가 텍스트는 검정(0,0,0)↔흰색(255,255,255) 경계가 1픽셀 단위로 끊어짐
    - 덧씌운 텍스트 아래 원본 글자 잔해, 지워진 영역의 배경색이 주변 종이 질감과 다르게 매끄러움
-   - 복사-붙여넣기 흔적: 특정 텍스트 블록 주변만 선명도·노이즈 수준이 현저히 다름
-   - 폰트 이질성: POS 열인쇄 폰트(비트맵 계열, 가장자리 회색조 계단)와 Windows/컴퓨터 입력 폰트(안티앨리어싱, 매끈한 곡선)가 동일 필드 또는 인접 필드에 혼재하는지 확인
-   - 배경 이질성: 거래일시·금액 등 핵심 필드 주변 배경이 나머지 영수증 배경보다 더 희고 균일하면(종이 질감·노이즈 없음) 흰색 덮어쓰기 편집으로 판단
+   - 배경 이질성: 핵심 필드 주변 배경만 종이 질감이 완전히 사라지고 균일한 흰색이며 그 위에 새 텍스트가 있는 경우
    - 날짜 값이 오늘 날짜와 일치하더라도, 배경 이질성·폰트 불일치 등 시각적 편집 흔적이 있으면 "거래핵심정보" 편집으로 판단
-   - [열전사 프린터 정상 범위 — 아래 미세한 차이는 편집 흔적으로 보지 않음]
+   - [열전사 프린터 정상 범위 — 아래 차이는 편집 흔적으로 보지 않음]
      * 날짜 연도(예: "26/04/21"의 "26")가 월·일보다 배경이 "약간" 밝거나 폰트 굵기가 "미세하게" 달라 보이는 것 (종이 질감·노이즈는 유지되어 있음)
      * 날짜 구분자(/, -)를 기준으로 앞뒤 숫자의 선명도나 폰트 두께가 미세하게 다른 것
      * 비스듬한 촬영·조명 반사로 특정 영역이 약간 밝아 보이는 것 (영수증 전체에 걸쳐 자연스러운 광량 그라데이션이 있음)
-   - [단일 증거만으로도 즉시 위변조(교체)로 판정해야 하는 명백한 편집 흔적]
-     * 순백색 직사각형 위에 새로운 텍스트·숫자가 덧씌워진 경우 — 흰색 덮어쓰기 후 교체의 확정적 증거
-     * 열인쇄 비트맵 폰트(가장자리 회색 계단, 도트 패턴)와 컴퓨터 폰트(안티앨리어싱, 매끄러운 곡선)가 동일 필드에 혼재하는 경우
+     * 영수증 내 서로 다른 섹션(가맹점명·합계금액·항목목록·결제정보) 간의 폰트 크기·굵기 차이 — POS 프린터는 중요도에 따라 다른 크기로 인쇄하는 것이 정상 (예: 합계금액이 크게, 항목명이 작게, 사업자번호가 작게)
+     * 같은 영수증 내에서 특정 줄·필드의 폰트가 다른 줄보다 작거나 크더라도, 해당 텍스트 주변의 종이 질감·열인쇄 노이즈가 자연스럽게 유지된다면 편집 흔적 아님
+     * 전체 이미지가 균일하게 저해상도·흐릿·픽셀 뭉개짐 — 특정 영역만 흐린 것이 아니라 이미지 전체가 동일하게 저화질이면 촬영 환경 문제이므로 편집 흔적으로 판단하지 마세요
+     * 영수증 위에 볼펜·연필 등으로 직접 쓴 손글씨(환자 이름, 담당자 메모, 서명 등)는 편집 흔적이 아닙니다 — 손글씨 자체를 위변조 증거나 편집부위로 분류하지 마세요
+   - [즉시 위변조 — 아래 중 하나라도 확인되면 위변조_점수 80 이상·판정 "위변조"·편집유형 "교체" 필수]
+     * 거래일시·금액 필드 주변에 배경보다 밝고 균일한 직사각형 영역이 있고 그 위에 텍스트가 있는 경우 — 흰색 덮어쓰기+교체의 확정적 증거이며 다른 어떤 "정상 범위" 예외도 적용되지 않음
+     * 열인쇄 비트맵 폰트(가장자리 회색 계단, 도트 패턴)와 컴퓨터 폰트(안티앨리어싱, 매끄러운 곡선)가 동일 필드 내에 혼재하는 경우 (단, 서로 다른 필드 간 폰트 차이는 제외)
      * 특정 핵심 필드(날짜·금액·가맹점명)의 배경만 종이 질감이 완전히 사라지고 균일한 흰색이며 그 위에 새 텍스트가 있는 경우
-     * 위 세 가지 중 하나라도 해당하면 단독으로 편집유형 "교체"로 판정하세요
+     * 위 세 가지는 반드시 위변조로 판정하세요 — "정상 범위" 예외는 적용되지 않습니다
    - [은닉 독립 평가 원칙 — 중요]
      * 카드번호·소지자명 등 개인정보를 검정색·흰색·스티커 등으로 단순히 가린 경우(가린 영역 위에 새 텍스트 없음)는 "카드정보 은닉"으로만 판정하세요
      * 은닉이 있더라도 날짜·금액·가맹점명 등 나머지 필드는 독립적으로 평가하세요 — 카드번호 가림이 있다는 이유로 날짜 등 다른 필드를 의심하지 마세요
@@ -461,9 +577,15 @@ const TAMPER_PROMPT = `한국 카드 영수증 이미지의 위변조 여부를 
    - 편집 흔적 없음: "없음"
 
 8. 편집 유형:
-   - 기존 내용을 지우고 새로운 텍스트나 숫자를 덧씌운 경우: "교체"
-   - 블러, 모자이크, 검정/흰색으로 단순히 가린 경우(새 텍스트 없음): "은닉"
-   - 편집 없음: "없음"
+   - 교체: ①기존 내용 위에 흰색·균일색 덮어쓰기 흔적이 있고 ②그 위에 새로운 텍스트·숫자가 명확히 삽입된 경우 — 폰트 크기·굵기 차이 단독으로는 교체로 판정하지 마세요. 흰색 패치·스티커가 사각형 형태로 육안에 확실히 식별되고 그 위에 새 텍스트가 있는 경우에만 "교체"를 선택하세요 — 확실하지 않으면 "없음"으로 판정하세요
+   - 은닉: 블러, 모자이크, 검정/흰색으로 단순히 가린 경우(가린 영역 위에 새 텍스트 없음)
+   - 없음: 편집 흔적 없음
+
+[출력 전 자기 점검 — 판정 전 반드시 직접 확인하세요]
+① 거래일시·금액 필드 주변에 배경보다 더 밝거나 균일한 직사각형이 보이는가?
+② 금액 또는 날짜 숫자의 폰트 특성(선의 매끄러움·안티앨리어싱)이 나머지 텍스트와 완전히 다른가?
+→ 하나라도 "예"이면 "정상"으로 판정하지 마세요
+→ "이상 없음"은 위 두 항목을 포함한 모든 핵심 필드를 적극적으로 확인한 후에만 기재하세요
 
 답변은 반드시 아래 형식 아홉 줄로만:
 위변조_점수: 0-100
@@ -474,11 +596,13 @@ AI생성_의심: 예|아니오
 다중영수증: 예|아니오
 편집부위: 없음|카드정보|거래핵심정보
 편집유형: 없음|은닉|교체
-이유: (발견된 모든 문제들, 없으면 "이상 없음")`;
+이유: (발견된 모든 문제들 — "이상 없음"은 거래일시·금액·가맹점명 세 필드를 모두 적극 확인 후에만 기재)`;
 
 // OCR + 위변조 분석을 단일 Gemini 호출로 수행하는 통합 프롬프트
 // ${KST_DATE} 는 호출 시점에 실제 날짜 문자열로 치환됨
 const COMBINED_PROMPT = `[중요] 이미지가 90°/180°/270° 회전된 상태일 수 있습니다. 텍스트 방향과 무관하게 각 항목의 레이블을 먼저 정확히 찾은 뒤, 그 레이블 바로 옆·아래에 붙어있는 값만 추출하세요. 레이블 없이 추측하지 마세요.
+
+[정확성 원칙] 이미지에 실제로 명확하게 인쇄된 내용만 답하세요. 흐릿하거나 부분적으로만 보여 확실하지 않은 항목은 "없음"으로 답하세요. 추측하거나 만들어내지 마세요.
 
 한국 카드 영수증 이미지에서 [정보 추출]과 [위변조 분석]을 동시에 수행하세요.
 
@@ -508,37 +632,53 @@ const COMBINED_PROMPT = `[중요] 이미지가 90°/180°/270° 회전된 상태
    - "고유번호", "일련번호" 레이블 옆 숫자는 사업자등록번호가 아닙니다 — 절대 추출하지 마세요
    - 전화번호(02-, 010/011/016/017/018/019로 시작)와 혼동하지 마세요
    - 카드사(한국신용카드결제, KOCES 등)가 아닌 가맹점 번호를 찾으세요
-   - 영수증 전체를 꼼꼼히 읽어 NNN-NN-NNNNN 패턴이 하나라도 있으면 반드시 추출하고, 진짜로 없을 때만 "없음"으로 답하세요
+   - NNN-NN-NNNNN 형식이 이미지에 명확하게 인쇄되어 있으면 추출하세요. 흐릿하거나 확실하지 않으면 "없음"으로 답하세요
 
 4. 카드 승인번호 (숫자 6~10자리)
    - 반드시 "승인번호", "승인 번호", "승인No", "Approval No" 레이블 바로 옆에 있는 숫자만 추출하세요
    - 숫자만 추출하세요 (공백·[CC] 등 기호 제거)
    - [절대 금지] 카드번호(XXXX-XXXX-****-**** 형식)의 일부를 승인번호로 추출하지 마세요
+   - 레이블이 명확히 보이지 않거나 숫자가 불확실하면 "없음"으로 답하세요
 
 5. 카드번호 앞 자리 (BIN)
    - "카드번호", "Card No", "승인카드번호" 레이블 옆에 있음
+   - [핵심 규칙] 첫 번째 * 또는 마스킹 기호가 나오기 전까지 연속으로 표시된 모든 숫자를 추출하세요
+   - 예시: "5434 12** **** ****" → "543412", "4033-1234-****-****" → "403312", "5377-****-****-****" → "5377"
    - 앞 4자리만 표시된 경우 → 4자리 추출, 앞 6자리 표시 → 6자리 추출, 앞 8자리 표시 → 앞 6자리만 추출
    - 마스킹(*) 처리된 자리는 무시하고, 숫자로 표시된 앞 자리만 추출하세요
-   - 카드번호 자체가 없으면 "없음" 기재
+   - 카드번호 레이블이 명확하지 않으면 "없음" 기재
+   - [OCR 혼동 주의] 카드번호에서 오인하기 쉬운 숫자 쌍: 5↔6, 0↔6, 0↔9, 1↔7, 3↔8. 카드번호는 금융 정보이므로 각 자리를 픽셀 수준에서 하나씩 신중하게 확인하세요
+   - 한 자리라도 확실하지 않으면 전체를 "없음"으로 답하세요 — 불확실한 숫자로 오답을 제출하지 마세요
 
 ━━━ 위변조 분석 [오늘 KST: \${KST_DATE}] ━━━
 
 이 날짜보다 이후인 경우에만 미래 날짜로 판단하세요.
 
+[위변조 판정 원칙]
+- "정상" 판정은 거래일시·금액·가맹점명 세 필드를 각각 적극적으로 확인하여 이상이 없음을 확인한 경우에만 사용하세요 — 이상을 발견하지 못했다는 이유만으로 "정상"으로 판정하지 마세요
+- 불확실하거나 확인이 충분하지 않으면 "의심"(위변조_점수 30-59)으로 판정하세요
+- 위변조_점수 0은 기본값이 아닙니다 — 모든 핵심 필드를 실제로 검토하여 완전히 이상이 없음을 확인한 경우에만 사용하세요
+- 위변조로 판정하려면 ①배경 이질성(흰색 덮어쓰기 흔적) 또는 ②폰트 기술 차이(비트맵↔안티앨리어싱 혼재) 중 하나의 명확한 물리적 증거가 필요합니다
+- "위변조"는 확실한 물리적 증거가 있는 경우에만 사용하세요 — 애매하거나 미세한 차이는 반드시 "의심"으로 판정하세요. 위변조로 단정하기 어려우면 의심 판정이 더 안전합니다
+
 1. 숫자·텍스트 편집 흔적 (최우선 — 가장 세밀하게 검토):
    - 금액(합계·소계·부가세·공급가액)·날짜·사업자번호·승인번호 각 필드를 개별적으로 집중 검토
-   - 같은 줄·같은 필드 안에서 숫자 간 폰트 크기·굵기·자간·기울기·획 두께가 일치하는지 비교
+   - 검토 핵심: 기존 인쇄된 내용 위에 새로운 데이터(숫자·텍스트)가 덧씌워졌는지 여부 — 폰트 크기·굵기 차이만으로는 편집 흔적으로 판단하지 마세요
    - 그림판(mspaint) 지우개+텍스트 도구 패턴: 특정 숫자 아래·주변에 배경보다 더 균일하고 깨끗한 직사각형 영역이 있는지
    - 안티앨리어싱 부재: 원본 열인쇄 텍스트는 가장자리에 미세한 회색 픽셀이 있으나, 그림판 추가 텍스트는 검정↔흰색 경계가 1픽셀 단위로 끊어짐
-   - 폰트 이질성: POS 열인쇄 폰트와 Windows/컴퓨터 입력 폰트가 동일 필드 또는 인접 필드에 혼재하는지 확인
-   - 배경 이질성: 거래일시·금액 등 핵심 필드 주변 배경이 나머지 영수증 배경보다 더 희고 균일하면 흰색 덮어쓰기 편집으로 판단
-   - [열전사 프린터 정상 범위 — 아래 미세한 차이는 편집 흔적으로 보지 않음]
+   - 배경 이질성: 핵심 필드 주변 배경만 종이 질감이 완전히 사라지고 균일한 흰색이며 그 위에 새 텍스트가 있는 경우
+   - [열전사 프린터 정상 범위 — 아래 차이는 편집 흔적으로 보지 않음]
      * 날짜 연도가 월·일보다 배경이 "약간" 밝거나 폰트 굵기가 "미세하게" 달라 보이는 것 (종이 질감·노이즈는 유지)
      * 비스듬한 촬영·조명 반사로 특정 영역이 약간 밝아 보이는 것
-   - [단일 증거만으로도 즉시 위변조(교체)로 판정해야 하는 명백한 편집 흔적]
-     * 순백색 직사각형 위에 새로운 텍스트·숫자가 덧씌워진 경우
-     * 열인쇄 비트맵 폰트와 컴퓨터 폰트가 동일 필드에 혼재하는 경우
-     * 특정 핵심 필드의 배경만 종이 질감이 완전히 사라지고 균일한 흰색이며 그 위에 새 텍스트가 있는 경우
+     * 영수증 내 서로 다른 섹션(가맹점명·합계금액·항목목록·결제정보) 간의 폰트 크기·굵기 차이 — POS 프린터는 중요도에 따라 다른 크기로 인쇄하는 것이 정상
+     * 같은 영수증 내에서 특정 줄·필드의 폰트가 다른 줄보다 작거나 크더라도, 해당 텍스트 주변의 종이 질감·열인쇄 노이즈가 자연스럽게 유지된다면 편집 흔적 아님
+     * 전체 이미지가 균일하게 저해상도·흐릿·픽셀 뭉개짐 — 이미지 전체가 동일하게 저화질이면 편집 흔적 아님
+     * 영수증 위에 볼펜·연필 등으로 직접 쓴 손글씨(환자 이름, 담당자 메모, 서명 등)는 편집 흔적이 아닙니다 — 손글씨 자체를 위변조 증거나 편집부위로 분류하지 마세요
+   - [즉시 위변조 — 아래 중 하나라도 확인되면 위변조_점수 80 이상·판정 "위변조"·편집유형 "교체" 필수]
+     * 거래일시·금액 필드 주변에 배경보다 밝고 균일한 직사각형 영역이 있고 그 위에 텍스트가 있는 경우 — 흰색 덮어쓰기+교체의 확정적 증거이며 다른 어떤 "정상 범위" 예외도 적용되지 않음
+     * 열인쇄 비트맵 폰트(가장자리 회색 계단, 도트 패턴)와 컴퓨터 폰트(안티앨리어싱, 매끄러운 곡선)가 동일 필드 내에 혼재하는 경우 (단, 서로 다른 필드 간 폰트 차이는 제외)
+     * 특정 핵심 필드(날짜·금액·가맹점명)의 배경만 종이 질감이 완전히 사라지고 균일한 흰색이며 그 위에 새 텍스트가 있는 경우
+     * 위 세 가지는 반드시 위변조로 판정하세요 — "정상 범위" 예외는 적용되지 않습니다
    - [은닉 독립 평가 원칙]
      * 카드번호·소지자명 등을 단순히 가린 경우(가린 영역 위에 새 텍스트 없음)는 "카드정보 은닉"으로만 판정
      * 은닉이 있더라도 날짜·금액·가맹점명 등 나머지 필드는 독립적으로 평가
@@ -557,9 +697,16 @@ const COMBINED_PROMPT = `[중요] 이미지가 90°/180°/270° 회전된 상태
    - 카드번호·소지자명·유효기간·카드사명만 편집 시: "카드정보"
    - 편집 흔적 없음: "없음"
 8. 편집 유형:
-   - 기존 내용을 지우고 새로운 텍스트·숫자를 덧씌운 경우: "교체"
-   - 블러·모자이크·단순 가리기(새 텍스트 없음): "은닉"
-   - 편집 없음: "없음"
+   - 교체: ①기존 내용 위에 흰색·균일색 덮어쓰기 흔적이 있고 ②그 위에 새로운 텍스트·숫자가 명확히 삽입된 경우 — 폰트 크기·굵기 차이 단독으로는 교체로 판정하지 마세요. 흰색 패치·스티커가 사각형 형태로 육안에 확실히 식별되고 그 위에 새 텍스트가 있는 경우에만 "교체"를 선택하세요 — 확실하지 않으면 "없음"으로 판정하세요
+   - 은닉: 블러·모자이크·단순 가리기(가린 영역 위에 새 텍스트 없음)
+   - 없음: 편집 흔적 없음
+
+[출력 전 자기 점검 — 판정 전 반드시 직접 확인하세요]
+① 거래일시·금액 필드 주변에 배경보다 더 밝거나 균일한 직사각형이 보이는가?
+② 금액 또는 날짜 숫자의 폰트 특성(선의 매끄러움·안티앨리어싱)이 나머지 텍스트와 완전히 다른가?
+→ 하나라도 "예"이면 "정상"으로 판정하지 마세요
+→ "이상 없음"은 위 두 항목을 포함한 모든 핵심 필드를 적극적으로 확인한 후에만 기재하세요
+→ "교체" 판정은 흰색·단색 직사각형 패치가 육안으로 명확히 보이고 그 위에 새 텍스트가 있는 경우에만 선택하세요
 
 답변은 반드시 아래 형식 열다섯 줄로만:
 영수증여부: 예|아니오
@@ -576,20 +723,50 @@ AI생성_의심: 예|아니오
 다중영수증: 예|아니오
 편집부위: 없음|카드정보|거래핵심정보
 편집유형: 없음|은닉|교체
-이유: (발견된 모든 문제들, 없으면 "이상 없음")
+이유: (발견된 모든 문제들 — "이상 없음"은 거래일시·금액·가맹점명 세 필드를 모두 적극 확인 후에만 기재)
 (없으면 해당 항목에 "없음" 기재)`;
 
-function parseTamperResult(raw) {
+function parseTamperResult(raw, kstNow = null) {
   if (!raw) return { tamperLevel: 'unknown', score: 0, isSuspectedStolen: false, isSuspectedAI: false, reason: '분석 결과 없음' };
-  const score   = parseInt(raw.match(/위변조_점수:\s*(\d+)/)?.[1] ?? '0');
-  const verdict = raw.match(/판정:\s*(정상|의심|위변조)/)?.[1] ?? '정상';
-  const reason  = raw.match(/이유:\s*(.+)/)?.[1]?.trim() ?? '이상 없음';
+  let score   = parseInt(raw.match(/위변조_점수:\s*(\d+)/)?.[1] ?? '0');
+  let verdict = raw.match(/판정:\s*(정상|의심|위변조)/)?.[1] ?? '정상';
+  let reason    = raw.match(/이유:\s*(.+)/)?.[1]?.trim() ?? '이상 없음';
   const isScreenshot        = raw.match(/화면캡처:\s*(예|아니오)/)?.[1] === '예';
   const isSuspectedStolen   = raw.match(/도용_의심:\s*(예|아니오)/)?.[1] === '예';
   const isSuspectedAI       = raw.match(/AI생성_의심:\s*(예|아니오)/)?.[1] === '예';
   const isMultipleReceipts  = raw.match(/다중영수증:\s*(예|아니오)/)?.[1] === '예';
   const editLocation        = raw.match(/편집부위:\s*(없음|카드정보|거래핵심정보)/)?.[1] ?? '없음';
   const editType            = raw.match(/편집유형:\s*(없음|은닉|교체)/)?.[1] ?? '없음';
+
+  // 미래 날짜 오판 교정: Gemini 학습 기준일이 오래된 경우 현재 이전 날짜를 "미래"로 오판하는 버그 보정
+  // reason에 "미래 날짜"가 포함되면 실제 날짜와 비교 후 과거/당일이면 정상으로 덮어쓴다
+  // 2자리 연도 지원: 영수증에 "25/12/31" 형식으로 표기된 경우 20XX년으로 해석
+  if (kstNow && (verdict === '위변조' || verdict === '의심') &&
+      (reason.includes('미래 날짜') || reason.includes('현재 날') ||
+       reason.includes('미래'))) {
+    // 지원 형식: YYYY년MM월DD일 / YY년 M월 D일 / YYYY/MM/DD / YYYY-MM-DD / YYYY.MM.DD / YY.MM.DD 등
+    const dateMatch = reason.match(/(\d{2,4})년\s*(\d{1,2})월\s*(\d{1,2})일/) ||
+                      reason.match(/(\d{2,4})[\/\-\.](\d{2})[\/\-\.](\d{2})/);
+    if (dateMatch) {
+      let year = +dateMatch[1];
+      if (year < 100) year += 2000; // 2자리 연도(예: 25 → 2025)
+      const claimedDate = new Date(Date.UTC(year, +dateMatch[2] - 1, +dateMatch[3]));
+      const todayKST = new Date(Date.UTC(kstNow.getUTCFullYear(), kstNow.getUTCMonth(), kstNow.getUTCDate()));
+      if (claimedDate <= todayKST) {
+        console.log('[YRG BG] 미래 날짜 오판 교정:', reason, '→ 정상 (실제 과거/당일:', dateMatch[0], ')');
+        verdict = '정상';
+        score = 0;
+        reason = '이상 없음'; // 교정 후 reason 초기화 — 반려 메시지에 오판 날짜 노출 방지
+      }
+    }
+  }
+
+  // 판정-점수 모순 교정: 판정이 '위변조'인데 점수가 30 미만이면 '의심'으로 완화
+  if (verdict === '위변조' && score < 30) {
+    console.log('[YRG BG] 판정 교정: 위변조 판정이나 점수', score, '< 30 → 의심으로 완화');
+    verdict = '의심';
+  }
+
   let tamperLevel;
   if (verdict === '위변조' && score >= 90) tamperLevel = 'high';
   else if (verdict === '위변조' || verdict === '의심') tamperLevel = 'medium';
@@ -612,7 +789,7 @@ async function analyzeVisualTamper(dataURL) {
 
   try {
     const raw = await callGeminiOCR(geminiApiKey, base64, mimeType, prompt, 4096);
-    const result = parseTamperResult(raw);
+    const result = parseTamperResult(raw, kstNow);
     console.log('[YRG BG] 위변조 분석 결과:', result.verdict, `(${result.score}점)`, result.reason);
     return result;
   } catch (err) {
@@ -697,7 +874,24 @@ async function geminiOCRFromDataURL(dataURL) {
   if (fields.text === '없음') {
     console.log('[YRG BG] 없음, CAREFUL 재시도...');
     rawText = await callGeminiOCR(geminiApiKey, base64, mimeType, CAREFUL_PROMPT);
-    fields.text = extractBizNoText(rawText);
+    const carefulBizNo = extractBizNoText(rawText);
+    // 체크섬 통과한 경우만 채택 — 할루시네이션 방지
+    if (carefulBizNo !== '없음') {
+      const carefulDigits = carefulBizNo.replace(/\D/g, '');
+      if (carefulDigits.length === 10 && validateKoreanBizNo(carefulDigits)) {
+        fields.text = carefulBizNo;
+      } else {
+        console.log('[YRG BG] CAREFUL 결과 체크섬 실패 — 없음 유지:', carefulBizNo);
+      }
+    }
+    // 레이블 파싱이 없음이어도 응답 전체 스캔으로 유효 번호 탐색
+    if (fields.text === '없음') {
+      const scanned = findValidBizNoInText(rawText);
+      if (scanned) {
+        console.log('[YRG BG] CAREFUL 전체 스캔 발견:', scanned);
+        fields.text = scanned;
+      }
+    }
     if (!fields.approvalNo) fields.approvalNo = extractApprovalNoText(rawText);
   }
 
@@ -709,24 +903,43 @@ async function geminiOCRFromDataURL(dataURL) {
   const digits = text.replace(/\D/g, '');
 
   if (digits.length === 10 && !validateKoreanBizNo(digits)) {
-    // 1단계: 1↔4 혼동만 시도 (가장 흔한 오류, 후보가 적음)
+    // 공통 CAREFUL 헬퍼 — 응답 전체 스캔으로 체크섬 통과 번호 반환, 없으면 null
+    const callCarefulAndFind = async () => {
+      const t = await callGeminiOCR(geminiApiKey, base64, mimeType, CAREFUL_PROMPT);
+      return { text: t, bizNo: findValidBizNoInText(t) };
+    };
+
+    // 1단계: 1↔4 혼동 (가장 흔한 OCR 오류, 후보 적음)
     let fixes = findVisualFix(digits, SIMILAR_STAGE1);
     if (fixes.length === 1) {
       const corrected = formatBizNo(fixes[0]);
       console.log('[YRG BG] 1↔4 자동수정:', text, '→', corrected);
-      return { success: true, text: corrected, approvalNo, cardBIN, merchantName, medicalFlag };
+      const { text: ct1, bizNo: cb1 } = await callCarefulAndFind();
+      if (cb1) {
+        if (cb1 !== corrected) console.log('[YRG BG] Stage1 CAREFUL 재확인:', corrected, '→', cb1);
+        return { success: true, text: cb1, approvalNo: approvalNo || extractApprovalNoText(ct1), cardBIN, merchantName, medicalFlag };
+      }
+      // CAREFUL 미확인 → 보정값 신뢰 불가, NTS 오조회 방지
+      console.log('[YRG BG] Stage1 CAREFUL 실패 — 없음 반환:', corrected);
+      return { success: true, text: '없음', approvalNo, cardBIN, merchantName, medicalFlag };
     }
 
-    // 2단계: 확장 혼동 집합 시도
+    // 2단계: 확장 혼동 집합
     fixes = findVisualFix(digits, SIMILAR_STAGE2);
     if (fixes.length === 1) {
       const corrected = formatBizNo(fixes[0]);
       console.log('[YRG BG] 시각 유사 자동수정:', text, '→', corrected);
-      return { success: true, text: corrected, approvalNo, cardBIN, merchantName, medicalFlag };
+      const { text: ct2, bizNo: cb2 } = await callCarefulAndFind();
+      if (cb2) {
+        if (cb2 !== corrected) console.log('[YRG BG] Stage2 CAREFUL 재확인:', corrected, '→', cb2);
+        return { success: true, text: cb2, approvalNo: approvalNo || extractApprovalNoText(ct2), cardBIN, merchantName, medicalFlag };
+      }
+      // CAREFUL 미확인 → 보정값 신뢰 불가, NTS 오조회 방지
+      console.log('[YRG BG] Stage2 CAREFUL 실패 — 없음 반환:', corrected);
+      return { success: true, text: '없음', approvalNo, cardBIN, merchantName, medicalFlag };
     }
 
-    // 3단계: 후보 다수 → 우선순위 기반 선택 (NTS 추가 호출 없이)
-    // 4→1 단일 치환 후보 우선 (열인쇄 영수증에서 가장 흔한 오독 패턴)
+    // 3단계: 후보 다수 → 4→1 단일 치환 우선
     const preferred = fixes.find(candidate => {
       let diffCount = 0, diffPos = -1;
       for (let i = 0; i < 10; i++) {
@@ -737,10 +950,18 @@ async function geminiOCRFromDataURL(dataURL) {
     if (preferred) {
       const corrected = formatBizNo(preferred);
       console.log('[YRG BG] 우선순위 선택 (4→1):', corrected);
-      return { success: true, text: corrected, approvalNo, cardBIN, merchantName, medicalFlag };
+      const { text: ctP, bizNo: cbP } = await callCarefulAndFind();
+      if (cbP) {
+        if (cbP !== corrected) console.log('[YRG BG] 우선순위 CAREFUL 재확인:', corrected, '→', cbP);
+        return { success: true, text: cbP, approvalNo: approvalNo || extractApprovalNoText(ctP), cardBIN, merchantName, medicalFlag };
+      }
+      // CAREFUL도 유효 번호 못 찾음 → 자동 보정값 신뢰 불가, NTS 오조회 방지
+      console.log('[YRG BG] 우선순위 보정 CAREFUL 실패 — 없음 반환:', corrected);
+      return { success: true, text: '없음', approvalNo, cardBIN, merchantName, medicalFlag };
     }
-    console.log('[YRG BG] 다수 후보 모호, 원본 반환:', text);
-    return { success: true, text, approvalNo, cardBIN, merchantName, medicalFlag };
+    // 체크섬 실패 + 후보 다수 모호
+    console.log('[YRG BG] 다수 후보 모호 (체크섬 실패), 없음 반환:', text);
+    return { success: true, text: '없음', approvalNo, cardBIN, merchantName, medicalFlag };
   }
 
   return { success: true, text, approvalNo, cardBIN, merchantName, medicalFlag };
@@ -759,8 +980,8 @@ async function geminiOCRAndTamperFromDataURL(dataURL) {
   const kstDateStr = `${kstNow.getUTCFullYear()}년 ${String(kstNow.getUTCMonth() + 1).padStart(2, '0')}월 ${String(kstNow.getUTCDate()).padStart(2, '0')}일`;
   const prompt = COMBINED_PROMPT.replace('${KST_DATE}', kstDateStr);
 
-  // 단일 통합 호출 (maxOutputTokens=512: OCR 6줄+Tamper 9줄 = ~300토큰으로 충분)
-  let rawText = await callGeminiOCR(geminiApiKey, base64, mimeType, prompt, 512);
+  // 단일 통합 호출 (maxOutputTokens=1024: 이유 필드가 길어질 수 있어 512→1024로 확장)
+  let rawText = await callGeminiOCR(geminiApiKey, base64, mimeType, prompt, 1024);
 
   const isReceipt = rawText?.match(/영수증여부:\s*(예|아니오)/)?.[1] !== '아니오';
   if (!isReceipt) {
@@ -774,7 +995,7 @@ async function geminiOCRAndTamperFromDataURL(dataURL) {
     cardBIN:      extractCardBINText(rawText),
     merchantName: extractMerchantNameText(rawText),
     medicalFlag:  extractMedicalFlagText(rawText),
-    tamperResult: parseTamperResult(rawText),
+    tamperResult: parseTamperResult(rawText, kstNow),
   };
   console.log('[YRG BG] 통합분석 — 상호명:', fields.merchantName || '없음', '/ 위변조판정:', fields.tamperResult?.verdict, `(${fields.tamperResult?.score}점)`);
 
@@ -782,7 +1003,24 @@ async function geminiOCRAndTamperFromDataURL(dataURL) {
   if (fields.text === '없음') {
     console.log('[YRG BG] 없음, CAREFUL 재시도...');
     const carefulText = await callGeminiOCR(geminiApiKey, base64, mimeType, CAREFUL_PROMPT);
-    fields.text = extractBizNoText(carefulText);
+    const carefulBizNo = extractBizNoText(carefulText);
+    // 체크섬 통과한 경우만 채택 — 할루시네이션 방지
+    if (carefulBizNo !== '없음') {
+      const carefulDigits = carefulBizNo.replace(/\D/g, '');
+      if (carefulDigits.length === 10 && validateKoreanBizNo(carefulDigits)) {
+        fields.text = carefulBizNo;
+      } else {
+        console.log('[YRG BG] CAREFUL 결과 체크섬 실패 — 없음 유지:', carefulBizNo);
+      }
+    }
+    // 레이블 파싱이 없음이어도 응답 전체 스캔으로 유효 번호 탐색
+    if (fields.text === '없음') {
+      const scanned = findValidBizNoInText(carefulText);
+      if (scanned) {
+        console.log('[YRG BG] CAREFUL 전체 스캔 발견:', scanned);
+        fields.text = scanned;
+      }
+    }
     if (!fields.approvalNo) fields.approvalNo = extractApprovalNoText(carefulText);
   }
 
@@ -790,18 +1028,43 @@ async function geminiOCRAndTamperFromDataURL(dataURL) {
   const digits = text.replace(/\D/g, '');
 
   if (digits.length === 10 && !validateKoreanBizNo(digits)) {
+    // 공통 CAREFUL 헬퍼 — 응답 전체 스캔으로 체크섬 통과 번호 반환, 없으면 null
+    const callCarefulAndFind = async () => {
+      const t = await callGeminiOCR(geminiApiKey, base64, mimeType, CAREFUL_PROMPT);
+      return { text: t, bizNo: findValidBizNoInText(t) };
+    };
+
+    // 1단계: 1↔4 혼동
     let fixes = findVisualFix(digits, SIMILAR_STAGE1);
     if (fixes.length === 1) {
       const corrected = formatBizNo(fixes[0]);
       console.log('[YRG BG] 1↔4 자동수정:', text, '→', corrected);
-      return { success: true, isReceipt: true, text: corrected, approvalNo, cardBIN, merchantName, medicalFlag, tamperResult };
+      const { text: ct1, bizNo: cb1 } = await callCarefulAndFind();
+      if (cb1) {
+        if (cb1 !== corrected) console.log('[YRG BG] Stage1 CAREFUL 재확인:', corrected, '→', cb1);
+        return { success: true, isReceipt: true, text: cb1, approvalNo: approvalNo || extractApprovalNoText(ct1), cardBIN, merchantName, medicalFlag, tamperResult };
+      }
+      // CAREFUL 미확인 → 보정값 신뢰 불가, NTS 오조회 방지
+      console.log('[YRG BG] Stage1 CAREFUL 실패 — 없음 반환:', corrected);
+      return { success: true, isReceipt: true, text: '없음', approvalNo, cardBIN, merchantName, medicalFlag, tamperResult };
     }
+
+    // 2단계: 확장 혼동 집합
     fixes = findVisualFix(digits, SIMILAR_STAGE2);
     if (fixes.length === 1) {
       const corrected = formatBizNo(fixes[0]);
       console.log('[YRG BG] 시각 유사 자동수정:', text, '→', corrected);
-      return { success: true, isReceipt: true, text: corrected, approvalNo, cardBIN, merchantName, medicalFlag, tamperResult };
+      const { text: ct2, bizNo: cb2 } = await callCarefulAndFind();
+      if (cb2) {
+        if (cb2 !== corrected) console.log('[YRG BG] Stage2 CAREFUL 재확인:', corrected, '→', cb2);
+        return { success: true, isReceipt: true, text: cb2, approvalNo: approvalNo || extractApprovalNoText(ct2), cardBIN, merchantName, medicalFlag, tamperResult };
+      }
+      // CAREFUL 미확인 → 보정값 신뢰 불가, NTS 오조회 방지
+      console.log('[YRG BG] Stage2 CAREFUL 실패 — 없음 반환:', corrected);
+      return { success: true, isReceipt: true, text: '없음', approvalNo, cardBIN, merchantName, medicalFlag, tamperResult };
     }
+
+    // 3단계: 후보 다수 → 4→1 단일 치환 우선
     const preferred = fixes.find(candidate => {
       let diffCount = 0, diffPos = -1;
       for (let i = 0; i < 10; i++) {
@@ -812,9 +1075,18 @@ async function geminiOCRAndTamperFromDataURL(dataURL) {
     if (preferred) {
       const corrected = formatBizNo(preferred);
       console.log('[YRG BG] 우선순위 선택 (4→1):', corrected);
-      return { success: true, isReceipt: true, text: corrected, approvalNo, cardBIN, merchantName, medicalFlag, tamperResult };
+      const { text: ctP, bizNo: cbP } = await callCarefulAndFind();
+      if (cbP) {
+        if (cbP !== corrected) console.log('[YRG BG] 우선순위 CAREFUL 재확인:', corrected, '→', cbP);
+        return { success: true, isReceipt: true, text: cbP, approvalNo: approvalNo || extractApprovalNoText(ctP), cardBIN, merchantName, medicalFlag, tamperResult };
+      }
+      // CAREFUL도 유효 번호 못 찾음 → 자동 보정값 신뢰 불가, NTS 오조회 방지
+      console.log('[YRG BG] 우선순위 보정 CAREFUL 실패 — 없음 반환:', corrected);
+      return { success: true, isReceipt: true, text: '없음', approvalNo, cardBIN, merchantName, medicalFlag, tamperResult };
     }
-    console.log('[YRG BG] 다수 후보 모호, 원본 반환:', text);
+    // 체크섬 실패 + 후보 다수 모호
+    console.log('[YRG BG] 다수 후보 모호 (체크섬 실패), 없음 반환:', text);
+    return { success: true, isReceipt: true, text: '없음', approvalNo, cardBIN, merchantName, medicalFlag, tamperResult };
   }
 
   return { success: true, isReceipt: true, text, approvalNo, cardBIN, merchantName, medicalFlag, tamperResult };
@@ -911,21 +1183,56 @@ function detectCardSchemeFrom4(bin4) {
   return null;
 }
 
+// BIN 시각 유사 숫자 치환 맵 (단일 자리 OCR 오독 교정용)
+const BIN_SIMILAR = {
+  '0': ['6', '9'], '1': ['7'], '3': ['8'], '5': ['6'],
+  '6': ['5', '0'], '7': ['1'], '8': ['3'], '9': ['0']
+};
+
+// 로컬 한국 BIN DB 내에서 단일 자리 시각 유사 치환 후보 탐색 (API 호출 없음)
+// 반환: 교정된 BIN 문자열 또는 null
+function tryBINVisualFix(bin) {
+  if (!_binKorea) return null;
+  for (let pos = 0; pos < bin.length; pos++) {
+    for (const alt of (BIN_SIMILAR[bin[pos]] || [])) {
+      const candidate = bin.slice(0, pos) + alt + bin.slice(pos + 1);
+      if (_binKorea[candidate]) return candidate;
+    }
+  }
+  return null;
+}
+
 async function verifyCardBIN(bin) {
   if (!bin || !/^\d{4,6}$/.test(bin)) {
     console.log('[YRG BG] BIN 검증 스킵 — 형식 오류:', bin);
     return { valid: true, skip: true, reason: 'BIN 형식 오류' };
   }
 
-  // 앞 4자리만 표시된 경우 → 브랜드 식별만 수행 (6자리 BIN 조회 불가)
+  // 한국 이동통신 번호 앞자리 — 현금영수증 발행번호이며 카드 BIN이 아님
+  if (/^01[016789]/.test(bin)) {
+    console.log('[YRG BG] BIN 검증 스킵 — 현금영수증 (휴대폰번호 패턴):', bin);
+    return { valid: true, skip: true, reason: '현금영수증 (휴대폰번호 BIN)' };
+  }
+
+  // 앞 4자리만 표시된 경우 → 브랜드 식별 또는 국내 DB prefix 조회
   if (bin.length === 4) {
     const scheme = detectCardSchemeFrom4(bin);
-    if (!scheme) {
-      console.warn('[YRG BG] BIN 4자리 — 알 수 없는 카드사 범위:', bin);
-      return { valid: false, bin, reason: `알 수 없는 카드번호 — 앞 4자리(${bin})가 주요 카드사 범위에 해당하지 않습니다` };
+    if (scheme) {
+      console.log('[YRG BG] BIN 4자리 브랜드 식별 통과:', bin, scheme);
+      return { valid: true, bin, scheme, source: 'scheme-4digit' };
     }
-    console.log('[YRG BG] BIN 4자리 브랜드 식별 통과:', bin, scheme);
-    return { valid: true, bin, scheme, source: 'scheme-4digit' };
+    // 국제 스킴 미매칭 → 국내 DB에서 4자리 prefix 조회 (BC카드 등 국내 전용 카드 대응)
+    try {
+      await loadBinData();
+      const hasKoreanMatch = Object.keys(_binKorea).some(k => k.startsWith(bin));
+      if (hasKoreanMatch) {
+        console.log('[YRG BG] BIN 4자리 국내 DB prefix 매칭 통과:', bin);
+        return { valid: true, bin, source: 'korean-4digit-prefix' };
+      }
+    } catch (e) {}
+    // 4자리 + 국내 DB prefix 미매칭 + 표준 스킴 미해당 → 카드번호 없는 영수증 추정
+    console.log('[YRG BG] BIN 4자리 검증 스킵 — 비표준 범위 + DB 미등록 (카드번호 없는 영수증 추정):', bin);
+    return { valid: true, skip: true, reason: '카드번호 형식 아님 (비표준 4자리 BIN)' };
   }
 
   // 로컬 BIN 데이터 우선 조회 (API 호출 없이 즉시 처리)
@@ -944,6 +1251,14 @@ async function verifyCardBIN(bin) {
       console.log('[YRG BG] BIN 검증 통과 — 국제 DB 매칭:', bin, intlMatch.b);
       return { valid: true, bin, issuer: intlMatch.b, scheme: intlMatch.sc, source: 'local-intl' };
     }
+
+    // 로컬 DB 미등록 → 시각 유사 숫자 1자리 교정 시도 (예: 5↔6 혼동으로 오추출된 경우)
+    const visualFixed = tryBINVisualFix(bin);
+    if (visualFixed) {
+      const d = _binKorea[visualFixed];
+      console.log('[YRG BG] BIN 시각 유사 교정:', bin, '→', visualFixed, d.i);
+      return { valid: true, bin: visualFixed, originalBIN: bin, issuer: d.i, type: d.t, source: 'local-korea-visual-fix' };
+    }
   } catch (loadErr) {
     console.warn('[YRG BG] 로컬 BIN 데이터 로드 실패, API로 fallback:', loadErr.message);
   }
@@ -951,10 +1266,11 @@ async function verifyCardBIN(bin) {
   // 로컬 DB 미등록 — 주요 카드사 범위 사전 검사
   const scheme = detectCardScheme(bin);
   if (!scheme) {
-    console.warn('[YRG BG] BIN 알 수 없는 카드사 범위:', bin, '— 주요 카드사(Visa/MC/Amex/JCB 등) BIN 아님');
-    return { valid: false, bin, reason: `알 수 없는 카드번호 — BIN ${bin}은(는) 주요 카드사 범위에 해당하지 않습니다` };
+    // 로컬 DB(국내+국제) 미등록 + 표준 카드 스킴 범위 미해당
+    // → 카드번호 없는 영수증에서 Gemini가 다른 숫자(승인번호·고객번호 등)를 BIN으로 잘못 추출한 것으로 판단
+    console.log('[YRG BG] BIN 검증 스킵 — 비표준 범위 + 로컬 미등록 (카드번호 없는 영수증 추정):', bin);
+    return { valid: true, skip: true, reason: '카드번호 형식 아님 (비표준 BIN)' };
   }
-
   console.log('[YRG BG] BIN 로컬 미등록, API 조회 시작:', bin, `(${scheme} 범위)`);
 
   // Fallback: handyapi.me BIN API (월 80,000회 무료, API Key 불필요)
